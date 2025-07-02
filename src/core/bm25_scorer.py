@@ -1,0 +1,328 @@
+import traceback
+
+import torch
+import logging
+import json
+from typing import Dict
+from transformers import AutoTokenizer
+import numpy as np
+from tqdm import tqdm
+import jnius_config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global variable to store Lucene classes
+_lucene_classes = None
+
+def setup_lucene(lucene_path: str):
+    """Setup JVM and Lucene classpath"""
+    jnius_config.set_classpath(lucene_path)
+
+def get_lucene_classes():
+    """Lazy load Lucene classes only when needed"""
+    global _lucene_classes
+    if _lucene_classes is None:
+        try:
+            from jnius import autoclass
+            _lucene_classes = {
+                'FSDirectory': autoclass('org.apache.lucene.store.FSDirectory'),
+                'Path': autoclass('java.nio.file.Paths'),
+                'Document': autoclass('org.apache.lucene.document.Document'),
+                'Field': autoclass('org.apache.lucene.document.Field'),
+                'TextField': autoclass('org.apache.lucene.document.TextField'),
+                'StringField': autoclass('org.apache.lucene.document.StringField'),
+                'StoredField': autoclass('org.apache.lucene.document.StoredField'),
+                'EnglishAnalyzer': autoclass('org.apache.lucene.analysis.en.EnglishAnalyzer'),
+                'IndexWriterConfig': autoclass('org.apache.lucene.index.IndexWriterConfig'),
+                'IndexWriter': autoclass('org.apache.lucene.index.IndexWriter'),
+                'FieldStore': autoclass('org.apache.lucene.document.Field$Store'),
+                'IndexReader': autoclass('org.apache.lucene.index.DirectoryReader'),
+                'IndexSearcher': autoclass('org.apache.lucene.search.IndexSearcher'),
+                'Term': autoclass('org.apache.lucene.index.Term'),
+                'TermQuery': autoclass('org.apache.lucene.search.TermQuery'),
+                'BooleanQuery' : autoclass('org.apache.lucene.search.BooleanQuery'),
+                'BooleanQueryBuilder' : autoclass('org.apache.lucene.search.BooleanQuery$Builder'),
+                'BooleanClause': autoclass('org.apache.lucene.search.BooleanClause'),
+                'BooleanClauseOccur': autoclass('org.apache.lucene.search.BooleanClause$Occur'),
+                'BM25Similarity' : autoclass('org.apache.lucene.search.similarities.BM25Similarity'),
+                'ConstantScoreQuery': autoclass('org.apache.lucene.search.ConstantScoreQuery'),
+                'DirectoryReader' : autoclass('org.apache.lucene.index.DirectoryReader'),
+                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute')
+
+            }
+        except Exception as e:
+            logger.error(f"Error loading Lucene classes: {e}")
+            raise
+    return _lucene_classes
+
+
+
+class BERTTokenBM25Indexer:
+    """Creates a Lucene index with BERT token mapping and BM25 scoring capability"""
+
+    def __init__(self, model_name="bert-base-uncased", index_path: str = None):
+        """Initialize the indexer"""
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.index_path = index_path
+
+            # Get Lucene classes lazily
+            classes = get_lucene_classes()
+            for name, cls in classes.items():
+                setattr(self, name, cls)
+
+        except Exception as e:
+            logger.error(f"Error initializing BERTTokenBM25Indexer: {e}")
+            raise
+
+    def create_index(self, documents: Dict[str, str], index_path: str = None):
+        """
+        Create a Lucene index with BERT token position mapping.
+
+        Args:
+            documents: Dictionary of document_id -> document_text
+            index_path: Path to store the index. If None, uses the path from initialization
+        """
+        if index_path is None:
+            index_path = self.index_path
+        if index_path is None:
+            raise ValueError("Index path must be provided either during initialization or when creating index")
+
+        writer = None
+        try:
+            # Setup index writer
+            directory = self.FSDirectory.open(self.Path.get(index_path))
+            analyzer = self.EnglishAnalyzer()
+            config = self.IndexWriterConfig(analyzer)
+            writer = self.IndexWriter(directory, config)
+
+            logger.info(f"Creating index at {index_path}")
+
+            # Add counter for progress logging
+            for count, (doc_id, doc_text) in enumerate(tqdm(documents.items(), total=len(documents))):
+                try:
+                    # BERT tokenization
+                    tokens = self.tokenizer.tokenize(doc_text)
+
+                    # Build full words and track positions
+                    words = []
+                    word_positions = []  # List of (word, start_pos, end_pos)
+                    current_word = ""
+                    word_start_pos = 0
+
+                    for i, token in enumerate(tokens):
+                        if token.startswith('##'):
+                            current_word += token[2:]
+                        else:
+                            if current_word:
+                                words.append(current_word)
+                                word_positions.append((len(words) - 1, word_start_pos, i - 1))
+                            current_word = token
+                            word_start_pos = i
+
+                    # Add last word
+                    if current_word:
+                        words.append(current_word)
+                        word_positions.append((len(words) - 1, word_start_pos, len(tokens) - 1))
+
+                    # Create and add Lucene document
+                    lucene_doc = self.Document()
+                    lucene_doc.add(self.StringField("id", doc_id, self.FieldStore.YES))
+                    lucene_doc.add(self.TextField("contents", " ".join(words), self.FieldStore.YES))
+                    lucene_doc.add(self.StoredField("positions", json.dumps(word_positions)))
+
+                    writer.addDocument(lucene_doc)
+
+                    # # Use counter instead of doc_id for progress logging
+                    # if count % 1000 == 0:
+                    #     logger.info(f"Indexed {count} documents")
+
+                except Exception as e:
+                    logger.error(f"Error processing document {doc_id}: {e}")
+                    continue
+
+            writer.commit()
+            logger.info("Indexing completed successfully")
+
+        except Exception as e:
+            logger.error(f"Error creating index: {e}")
+            raise
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as e:
+                    logger.error(f"Error closing index writer: {e}")
+
+
+class TokenBM25Scorer:
+    def __init__(self, index_path: str, k1: float = 1.2, b: float = 0.75):
+        try:
+            # Get Lucene classes lazily
+            classes = get_lucene_classes()
+            for name, cls in classes.items():
+                setattr(self, name, cls)
+
+            # Get additional required Lucene classes
+            from jnius import autoclass
+            self.BM25Similarity = autoclass('org.apache.lucene.search.similarities.BM25Similarity')
+
+            # # Open index and setup searcher with BM25
+            directory = self.FSDirectory.open(self.Path.get(index_path))
+            self.reader = self.DirectoryReader.open(directory)
+            self.searcher = self.IndexSearcher(self.reader.getContext())
+            self.searcher.setSimilarity(self.BM25Similarity(k1, b))
+
+
+        except Exception as e:
+            logger.error(f"Error initializing TokenBM25Scorer: {e}")
+            raise
+
+    def compute_bm25_term_weight(self, docid: str, terms: list) -> dict:
+        """
+        Compute BM25 weights for multiple terms in a specific document.
+
+        Args:
+            docid: Document ID
+            terms: List of terms to compute weights for
+
+        Returns:
+            dict: Dictionary mapping terms to their BM25 scores
+        """
+        try:
+            # First verify document exists
+            id_term = self.Term("id", str(docid))
+            id_query = self.TermQuery(id_term)
+            doc_hits = self.searcher.search(id_query, 1)
+
+            if doc_hits.totalHits.value() == 0:
+                # logger.warning(f"Document {docid} not found")
+                return {term: 0.0 for term in terms}
+
+            # Create analyzer - same as used during indexing
+            analyzer = self.EnglishAnalyzer()
+
+            # Get individual scores for each term
+            term_scores = {}
+            for term in terms:
+                # Use analyzer to process the term
+                stream = analyzer.tokenStream("contents", term)
+                charTermAtt = stream.addAttribute(self.CharTermAttribute)
+                stream.reset()
+
+                analyzed_terms = []
+                while stream.incrementToken():
+                    analyzed_terms.append(charTermAtt.toString())
+                stream.end()
+                stream.close()
+
+                # logger.info(f"Original term: '{term}', Analyzed terms: {analyzed_terms}")
+
+                if not analyzed_terms:  # Skip if term was entirely stopwords
+                    term_scores[term] = 0.0
+                    continue
+
+                # Build query for all analyzed terms
+                term_builder = self.BooleanQueryBuilder()
+                for analyzed_term in analyzed_terms:
+                    term_builder.add(
+                        self.TermQuery(self.Term("contents", analyzed_term)),
+                        self.BooleanClauseOccur.MUST
+                    )
+
+                # Combine with document filter
+                query_builder = self.BooleanQueryBuilder()
+                query_builder.add(id_query, self.BooleanClauseOccur.FILTER)
+                query_builder.add(term_builder.build(), self.BooleanClauseOccur.MUST)
+                final_query = query_builder.build()
+
+                # Search and get score
+                hits = self.searcher.search(final_query, 1)
+                if hits.totalHits.value() > 0:
+                    term_scores[term] = hits.scoreDocs[0].score
+                    # logger.info(f"Found term '{term}' with score {term_scores[term]}")
+                else:
+                    term_scores[term] = 0.0
+                    # logger.info(f"Term '{term}' not found in document")
+
+            return term_scores
+
+        except Exception as e:
+            logger.error(f"Error computing BM25 score: {e}")
+            return {term: 0.0 for term in terms}
+
+    def get_token_scores(self, query: str, doc_id: str, max_length: int = 512) -> torch.Tensor:
+        """
+        Get BM25 scores for each token position in a document based on a query.
+
+        Args:
+            query: Search query
+            doc_id: Document ID
+            max_length: Maximum sequence length to consider
+
+        Returns:
+            torch.Tensor: Tensor of token scores
+        """
+        if not isinstance(query, str) or not query.strip():
+            return torch.zeros(max_length)
+
+        try:
+            # Search for document by ID
+            id_term = self.Term("id", str(doc_id))
+            id_query = self.TermQuery(id_term)
+            hits = self.searcher.search(id_query, 1)
+
+            if hits.totalHits.value() == 0:
+                return torch.zeros(max_length)
+
+            # Get document content and positions
+            doc = self.searcher.storedFields().document(hits.scoreDocs[0].doc)
+            doc_content = doc.get("contents")
+            positions_str = doc.get("positions")
+
+            if not doc_content or not positions_str:
+                return torch.zeros(max_length)
+
+            # Parse positions and content
+            word_positions = json.loads(positions_str)
+            doc_words = doc_content.split()
+
+            # Get scores for all query terms at once
+            query_terms = query.lower().split()
+            term_scores = self.compute_bm25_term_weight(doc_id, query_terms)
+
+            # Initialize score array
+            token_scores = np.zeros(max_length)
+
+            # Apply scores to token positions
+            for word_idx, start_pos, end_pos in word_positions:
+                if not (0 <= word_idx < len(doc_words)):
+                    continue
+
+                if not (0 <= start_pos < max_length):
+                    continue
+
+                end_pos = min(end_pos, max_length - 1)
+                word = doc_words[word_idx].lower()
+
+                # Look up score for this word
+                score = term_scores.get(word, 0.0)
+                if score > 0:
+                    token_scores[start_pos:end_pos + 1] = score
+            # print(token_scores)
+
+            return torch.FloatTensor(token_scores)
+
+        except Exception as e:
+            logger.error(f"Error in get_token_scores: {e}", exc_info=True)
+            print(traceback.format_exc())
+            return torch.zeros(max_length)
+
+    def __del__(self):
+        try:
+            if hasattr(self, 'reader'):
+                self.reader.close()
+        except Exception as e:
+            logger.error(f"Error closing index reader: {e}")
