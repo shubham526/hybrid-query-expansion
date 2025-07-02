@@ -1,8 +1,14 @@
 import logging
 import sys
 import os
-from datetime import datetime
 from typing import Optional
+from pathlib import Path
+from datetime import datetime
+
+
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return Path(path)
 
 
 def setup_logging(log_level: str = "INFO",
@@ -232,20 +238,29 @@ def log_evaluation_progress(logger: logging.Logger, current: int, total: int,
 
 
 # Example usage functions for your specific project
-def setup_experiment_logging(experiment_name: str, log_level: str = "INFO") -> logging.Logger:
+def setup_experiment_logging(experiment_name: str,
+                             log_level: str = "INFO",
+                             log_file: Optional[str] = None) -> logging.Logger:
     """
     Setup logging specifically for expansion weight learning experiments.
 
     Args:
         experiment_name: Name of the experiment
         log_level: Logging level
+        log_file: Optional path to log file. If None, generated automatically.
 
     Returns:
         Configured logger
     """
+    # If a specific log file isn't provided, generate one automatically.
+    if not log_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = ensure_dir(f"logs/{experiment_name}") # Helper to create dir
+        log_file = log_dir / f"{timestamp}.log"
+
     logger = setup_logging(
         log_level=log_level,
-        experiment_name=experiment_name,
+        log_file=str(log_file), # Pass the final path to the general setup function
         log_to_console=True
     )
 

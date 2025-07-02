@@ -4,32 +4,10 @@ Evaluates a trained importance-weighted query expansion model on a test set.
 
 This script performs the final evaluation by:
 1.  Loading learned weights (alpha, beta, gamma) from a file.
-2.  Running the full expansion and multi-vector reranking pipeline on a specified
-    test dataset (e.g., TREC DL 2019/2020).
-3.  Optionally conducting a comprehensive ablation study to evaluate all baseline
-    and component models.
-4.  Saving TREC-formatted run files for each model configuration.
-5.  Computing and saving final evaluation metrics (e.g., nDCG@10, MAP).
-
-Usage:
-    # For a standard hold-out test set (e.g., TREC DL 2020)
-    python scripts/evaluate_model.py \
-        --weights_file ./models/learned_weights.json \
-        --dataset msmarco-passage/trec-dl-2020 \
-        --output_dir ./evaluation_results \
-        --index_path ./indexes/msmarco-passage_bert-base-uncased \
-        --lucene_path /path/to/your/lucene/jars/ \
-        --run_ablation --save_runs
-
-    # For a specific fold in a cross-validation setup
-    python scripts/evaluate_model.py \
-        --weights_file ./models_robust/fold1/learned_weights.json \
-        --dataset disks45/nocr/trec-robust-2004 \
-        --query_ids_file ./folds/robust_fold_1_test.txt \
-        --output_dir ./evaluation_results_robust/fold1 \
-        --index_path ./indexes/disks45_nocr_trec-robust-2004_bert-base-uncased \
-        --lucene_path /path/to/your/lucene/jars/ \
-        --save_runs
+2.  Loading an initial candidate run from the best available source (scoreddocs or a run file).
+3.  Running the full expansion and multi-vector reranking pipeline on the candidate set.
+4.  Optionally conducting a comprehensive ablation study.
+5.  Saving final run files and evaluation metrics.
 """
 
 import argparse
@@ -53,7 +31,7 @@ from src.core.semantic_similarity import SemanticSimilarity
 from src.models.expansion_models import create_baseline_comparison_models, ExpansionModel
 from src.models.multivector_reranking import MultiVectorReranker
 from src.evaluation.evaluator import TRECEvaluator
-from src.utils.file_utils import load_learned_weights, save_json, save_trec_run, ensure_dir
+from src.utils.file_utils import load_learned_weights, load_trec_run, save_json, save_trec_run, ensure_dir
 from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation, log_results
 
 # Conditionally import BM25 infrastructure
@@ -63,12 +41,29 @@ try:
 
     BM25_AVAILABLE = True
 except ImportError as e:
-    logging.warning(f"BM25 scorer components not available. BM25 scores will be zero. Error: {e}")
+    logging.error(f"Failed to import from 'src'. Please run 'pip install -e .' from the project root. Error: {e}")
     TokenBM25Scorer = None
     initialize_lucene = None
     BM25_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def get_query_text(query_obj: Any) -> str:
+    """
+    Flexibly extracts query text from different ir_datasets query types.
+    Handles MS MARCO (text) and TREC (title, description) formats.
+    """
+    if hasattr(query_obj, 'text'):
+        return query_obj.text
+    elif hasattr(query_obj, 'title'):
+        if hasattr(query_obj, 'description') and query_obj.description:
+            return f"{query_obj.title} {query_obj.description}"
+        return query_obj.title
+    else:
+        logger.warning(f"Could not determine query text for query_id {query_obj.query_id}. Defaulting to empty string.")
+        return ""
+
 
 
 class ModelEvaluator:
@@ -102,10 +97,10 @@ class ModelEvaluator:
                 reranked_run[qid] = []
                 continue
 
-            top_docs = first_stage_runs[qid][:self.top_k_pseudo_docs]
-            pseudo_docs_text = [documents.get(doc_id, "") for doc_id, _ in top_docs]
-            pseudo_scores = [score for _, score in top_docs]
-            reference_doc_id = top_docs[0][0] if top_docs else None
+            top_docs_for_prf = first_stage_runs[qid][:self.top_k_pseudo_docs]
+            pseudo_docs_text = [documents.get(doc_id, "") for doc_id, _ in top_docs_for_prf]
+            pseudo_scores = [score for _, score in top_docs_for_prf]
+            reference_doc_id = top_docs_for_prf[0][0] if top_docs_for_prf else None
 
             if not any(pseudo_docs_text):
                 reranked_run[qid] = [(doc_id, score) for doc_id, score in first_stage_runs[qid]]
@@ -137,31 +132,22 @@ def main():
         description="Evaluate a trained importance-weighted query expansion model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # --- Main Arguments ---
     parser.add_argument('--weights-file', type=str, required=True, help='Path to the learned_weights.json file.')
     parser.add_argument('--dataset', type=str, required=True, help='Name of the ir_datasets test set.')
+    parser.add_argument('--run-file-path', type=str,
+                        help='Optional path to a baseline TREC run file for candidate generation.')
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Directory to save evaluation results and run files.')
-
-    # --- Filtering and Model Arguments ---
     parser.add_argument('--query-ids-file', type=str, default=None,
-                        help='Optional path to a file with query IDs to evaluate (for k-fold CV).')
+                        help='Optional path to a file with query IDs to evaluate.')
     parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
                         help='Sentence-transformer model for reranking.')
-
-    # --- BM25 Arguments ---
     parser.add_argument('--index-path', type=str, default=None, help='Path to the pre-built BM25 index.')
     parser.add_argument('--lucene-path', type=str, default=None, help='Path to Lucene JAR files.')
-
-    # --- Evaluation Options ---
-    parser.add_argument('--run-ablation', action='store_true',
-                        help='If set, run a full ablation study with all baseline models.')
+    parser.add_argument('--run-ablation', action='store_true', help='If set, run a full ablation study.')
     parser.add_argument('--save-runs', action='store_true',
                         help='If set, save the TREC-formatted run file for each model.')
-
-    # --- Logging ---
     parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
-
     args = parser.parse_args()
 
     output_dir = ensure_dir(args.output_dir)
@@ -170,7 +156,6 @@ def main():
     log_experiment_info(logger, **vars(args))
 
     try:
-        # --- Load Learned Weights and Initialize Components ---
         logger.info(f"Loading learned weights from: {args.weights_file}")
         learned_weights = load_learned_weights(args.weights_file)
 
@@ -181,20 +166,28 @@ def main():
             bm25_scorer = None
             if args.index_path:
                 if not BM25_AVAILABLE: raise ImportError("BM25 components requested but not available.")
-                if not args.lucene_path: raise ValueError("--lucene_path is required for BM25.")
+                if not args.lucene_path: raise ValueError("--lucene-path is required for BM25.")
                 initialize_lucene(args.lucene_path)
                 bm25_scorer = TokenBM25Scorer(args.index_path)
 
-        # --- Load and Filter Data ---
         with TimedOperation(logger, f"Loading and filtering dataset: {args.dataset}"):
             dataset = ir_datasets.load(args.dataset)
-            all_queries = {q.query_id: q.text for q in dataset.queries_iter()}
-            all_qrels = {q.query_id: {d.doc_id: d.relevance for d in q.qrels_iter()} for q in dataset.queries_iter()}
-            all_documents = {d.doc_id: d.text for d in dataset.docs_iter()}
+            all_queries = {q.query_id: get_query_text(q) for q in dataset.queries_iter()}
+            all_qrels = {qrel.query_id: {qrel.doc_id: qrel.relevance} for qrel in dataset.qrels_iter()}
+            all_documents = {d.doc_id: (d.text if hasattr(d, 'text') else d.body) for d in dataset.docs_iter()}
+
+            # --- FIX: Implement the correct candidate set loading logic ---
             all_runs = defaultdict(list)
             if dataset.has_scoreddocs():
+                logger.info("Found 'scoreddocs' in dataset. Using them as the candidate set.")
                 for sdoc in dataset.scoreddocs_iter():
                     all_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
+            elif args.run_file_path and Path(args.run_file_path).exists():
+                logger.info(f"Using user-provided run file at '{args.run_file_path}' as the candidate set.")
+                all_runs.update(load_trec_run(args.run_file_path))
+            else:
+                raise ValueError(
+                    "A source for candidate documents is required for evaluation. Provide a run file via --run-file-path or use a dataset with scoreddocs.")
 
             qids_to_evaluate = set(all_queries.keys())
             if args.query_ids_file:
@@ -210,20 +203,16 @@ def main():
             }
         logger.info(f"Loaded {len(eval_data['queries'])} queries for final evaluation.")
 
-        # --- Instantiate the Evaluator and Define Models ---
         evaluator = ModelEvaluator(reranker, rm_expansion, semantic_sim, bm25_scorer)
-
         models_to_run = {}
         if args.run_ablation:
             logger.info("Creating all baseline and ablation models for a full study.")
             models_to_run = create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)
         else:
             logger.info("Evaluating only the final trained model ('our_method').")
-            final_model = create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)[
-                'our_method']
-            models_to_run['our_method'] = final_model
+            models_to_run['our_method'] = \
+            create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)['our_method']
 
-        # --- Run Evaluation Loop ---
         all_runs_for_eval = {'FirstStage': eval_data['first_stage_runs']}
         for model_name, expansion_model in models_to_run.items():
             logger.info(f"--- Evaluating model: {model_name} ---")
@@ -231,11 +220,9 @@ def main():
                 run_results = evaluator.evaluate_model(expansion_model, eval_data)
                 all_runs_for_eval[model_name] = run_results
 
-        # --- Compute Final Metrics and Save ---
         trec_evaluator = TRECEvaluator()
         comparison_results = trec_evaluator.compare_runs(all_runs_for_eval, eval_data['qrels'],
                                                          baseline_run='FirstStage')
-
         log_results(logger, comparison_results, "FINAL EVALUATION RESULTS")
         save_json(comparison_results, output_dir / 'evaluation_metrics.json')
 
@@ -244,7 +231,6 @@ def main():
             for run_name, run_data in all_runs_for_eval.items():
                 save_trec_run(run_data, runs_dir / f"{run_name}.txt", run_name=run_name)
 
-        # --- Print Final Summary Table ---
         print("\n" + "=" * 80 + f"\nFinal Results on {args.dataset}" + (
             " (filtered)" if args.query_ids_file else "") + "\n" + "=" * 80)
         print(trec_evaluator.create_results_table(comparison_results))
