@@ -7,14 +7,22 @@ optimizes the weights (alpha, beta, gamma) for combining RM, BM25, and semantic
 similarity scores. The optimization is performed by maximizing a specified
 retrieval metric (e.g., nDCG@10) on a validation set.
 
-The core of this script is a lightweight evaluation function that uses the
-pre-computed features, making the optimization process fast and efficient.
+For cross-validation, it can operate on a specific subset of queries defined
+in a `--query_ids_file`.
 
 Usage:
+    # For a single validation set (e.g., TREC DL 2019)
     python scripts/train_weights.py \
         --feature_file ./training_data/msmarco-passage_trec-dl-2019_features.json.gz \
         --validation_dataset msmarco-passage/trec-dl-2019 \
         --output_dir ./models
+
+    # For a specific fold in a cross-validation setup
+    python scripts/train_weights.py \
+        --feature_file ./training_data_robust/features.json.gz \
+        --validation_dataset disks45/nocr/trec-robust-2004 \
+        --query_ids_file ./folds/robust_fold_1_train.txt \
+        --output_dir ./models_robust/fold1
 """
 
 import argparse
@@ -48,50 +56,26 @@ class WeightTrainer:
     """
 
     def __init__(self, reranker: MultiVectorReranker):
-        """
-        Initializes the WeightTrainer.
-
-        Args:
-            reranker: An instance of the MultiVectorReranker.
-        """
+        """Initializes the WeightTrainer."""
         self.reranker = reranker
         logger.info("WeightTrainer initialized with a multi-vector reranker.")
 
     def create_evaluation_function(self,
                                    validation_data: Dict[str, Any],
                                    metric: str = "ndcg_cut_10") -> Callable[[Tuple[float, float, float]], float]:
-        """
-        Creates a lightweight evaluation function for the optimizer.
-
-        This function uses pre-computed features to quickly evaluate the performance
-        of a given set of weights (alpha, beta, gamma).
-
-        Args:
-            validation_data: A dictionary containing 'queries', 'qrels', 'first_stage_runs',
-                             and the pre-computed 'features'.
-            metric: The evaluation metric to optimize (e.g., 'ndcg_cut_10').
-
-        Returns:
-            A function that takes a weight tuple and returns a performance score.
-        """
+        """Creates a lightweight evaluation function for the optimizer."""
         queries = validation_data['queries']
         qrels = validation_data['qrels']
         first_stage_runs = validation_data['first_stage_runs']
         features = validation_data['features']
         documents = validation_data['documents']
 
-        # Pre-load documents for candidates to speed up the loop
         candidate_docs_text = {}
         for qid, run in first_stage_runs.items():
-            candidate_docs_text[qid] = []
-            for doc_id, score in run:
-                if doc_id in documents:
-                    candidate_docs_text[qid].append((doc_id, documents[doc_id], score))
+            candidate_docs_text[qid] = [(doc_id, documents.get(doc_id, ""), score) for doc_id, score in run]
 
         def evaluate_weights(weights: Tuple[float, float, float]) -> float:
-            """
-            The actual evaluation function passed to the optimizer.
-            """
+            """The actual evaluation function passed to the optimizer."""
             alpha, beta, gamma = weights
             reranked_runs = {}
 
@@ -101,32 +85,24 @@ class WeightTrainer:
 
                 query_features = features[qid]
 
-                # --- Fast Importance Calculation ---
-                # This is the core of the efficient optimization.
-                # We are just applying weights to pre-computed scores.
-                importance_weights = {}
-                for term, term_data in query_features['term_features'].items():
-                    score = (alpha * term_data['rm_weight'] +
-                             beta * term_data['bm25_score'] +
-                             gamma * term_data['semantic_score'])
-                    importance_weights[term] = score
+                importance_weights = {
+                    term: (alpha * term_data['rm_weight'] +
+                           beta * term_data['bm25_score'] +
+                           gamma * term_data['semantic_score'])
+                    for term, term_data in query_features['term_features'].items()
+                }
 
-                # --- Reranking ---
-                # The reranker takes the candidates and the newly computed importance scores.
                 reranked_results = self.reranker.rerank(
                     query=query_text,
                     expansion_terms=[(term, 0) for term in query_features['term_features'].keys()],
-                    # rm_weight is not needed here
                     importance_weights=importance_weights,
                     candidate_results=candidate_docs_text[qid]
                 )
                 reranked_runs[qid] = reranked_results
 
-            # --- Final Metric Computation ---
-            if not reranked_runs:
-                return 0.0
+            if not reranked_runs: return 0.0
 
-            evaluator = create_trec_dl_evaluator()  # Using default TREC DL metrics
+            evaluator = create_trec_dl_evaluator()
             evaluation = evaluator.evaluate_run(reranked_runs, qrels)
 
             score = evaluation.get(metric, 0.0)
@@ -139,32 +115,18 @@ class WeightTrainer:
               validation_data: Dict[str, Any],
               optimizer_type: str = "lbfgs",
               metric: str = "ndcg_cut_10") -> Tuple[float, float, float]:
-        """
-        Executes the full weight training pipeline.
-
-        Args:
-            validation_data: Dictionary with all required validation data components.
-            optimizer_type: The optimization algorithm to use ('lbfgs', 'grid', 'random').
-            metric: The metric to optimize.
-
-        Returns:
-            A tuple containing the optimal (alpha, beta, gamma) weights.
-        """
+        """Executes the full weight training pipeline."""
         logger.info(f"Starting weight training with optimizer '{optimizer_type}' to maximize '{metric}'")
 
-        # --- Create the lightweight evaluation function ---
         evaluation_function = self.create_evaluation_function(validation_data, metric)
 
-        # --- Evaluate baseline performance (equal weights) ---
         with TimedOperation(logger, "Evaluating baseline performance (weights=1,1,1)"):
             baseline_weights = (1.0, 1.0, 1.0)
             baseline_score = evaluation_function(baseline_weights)
         logger.info(f"Baseline performance with equal weights ({metric}): {baseline_score:.4f}")
 
-        # --- Run Optimization ---
         optimizer = create_optimizer(optimizer_type)
         with TimedOperation(logger, f"{optimizer_type.upper()} optimization"):
-            # The optimizer will repeatedly call the fast evaluation_function
             optimal_weights = optimizer.optimize_weights(
                 training_data=None,  # Not needed as features are pre-computed
                 validation_queries=validation_data['queries'],
@@ -172,7 +134,6 @@ class WeightTrainer:
                 evaluation_function=evaluation_function
             )
 
-        # --- Evaluate final performance ---
         with TimedOperation(logger, "Evaluating final learned weights"):
             final_score = evaluation_function(optimal_weights)
 
@@ -193,64 +154,67 @@ def main():
         description="Learn optimal query expansion weights using pre-computed features.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # --- Required Arguments ---
-    parser.add_argument('--feature_file', type=str, required=True,
-                        help='Path to the pre-computed feature file (e.g., features.json.gz).')
-    parser.add_argument('--validation_dataset', type=str, required=True,
-                        help='Name of the ir_datasets validation set (must match feature file).')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Directory to save the learned weights.')
-
-    # --- Model & Optimization Arguments ---
-    parser.add_argument('--semantic_model', type=str, default='all-MiniLM-L6-v2',
-                        help='Name of the sentence-transformer model used for reranking.')
+    parser.add_argument('--feature-file', type=str, required=True, help='Path to the pre-computed feature file.')
+    parser.add_argument('--validation-dataset', type=str, required=True, help='Name of the ir_datasets validation set.')
+    parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the learned weights.')
+    parser.add_argument('--query-ids-file', type=str, default=None,
+                        help='Optional path to a file with query IDs to use for training (for k-fold CV).')
+    parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
+                        help='Sentence-transformer model for reranking.')
     parser.add_argument('--optimizer', type=str, default='lbfgs', choices=['lbfgs', 'grid', 'random'],
-                        help='Optimization algorithm to use.')
-    parser.add_argument('--metric', type=str, default='ndcg_cut_10',
-                        help='The retrieval metric to optimize.')
-
-    # --- Logging Arguments ---
-    parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+                        help='Optimization algorithm.')
+    parser.add_argument('--metric', type=str, default='ndcg_cut_10', help='The retrieval metric to optimize.')
+    parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
     args = parser.parse_args()
 
-    # --- Setup ---
     output_dir = ensure_dir(args.output_dir)
     logger = setup_experiment_logging("train_weights", args.log_level, str(output_dir / 'weight_training.log'))
-
     log_experiment_info(logger, **vars(args))
 
     try:
-        # --- Load All Necessary Data ---
-        with TimedOperation(logger, "Loading all data for validation"):
+        # --- Load and Filter Data ---
+        with TimedOperation(logger, "Loading and filtering all data for training"):
             logger.info(f"Loading features from: {args.feature_file}")
-            features = load_json(args.feature_file)
+            all_features = load_json(args.feature_file)
 
             logger.info(f"Loading validation dataset: {args.validation_dataset}")
             dataset = ir_datasets.load(args.validation_dataset)
 
-            queries = {q.query_id: q.text for q in dataset.queries_iter()}
-            qrels = {q.query_id: {d.doc_id: d.relevance for d in q.qrels_iter()} for q in dataset.queries_iter()}
-            documents = {d.doc_id: d.text for d in dataset.docs_iter()}
-            first_stage_runs = defaultdict(list)
+            all_queries = {q.query_id: q.text for q in dataset.queries_iter()}
+            all_qrels = {q.query_id: {d.doc_id: d.relevance for d in q.qrels_iter()} for q in dataset.queries_iter()}
+            all_documents = {d.doc_id: d.text for d in dataset.docs_iter()}
+            all_runs = defaultdict(list)
             if dataset.has_scoreddocs():
                 for sdoc in dataset.scoreddocs_iter():
-                    first_stage_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
+                    all_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
+
+            queries_to_use = all_queries
+            if args.query_ids_file:
+                logger.info(f"Filtering data to subset from: {args.query_ids_file}")
+                with open(args.query_ids_file, 'r') as f:
+                    subset_qids = {line.strip() for line in f if line.strip()}
+
+                queries_to_use = {qid: text for qid, text in all_queries.items() if qid in subset_qids}
+                features_to_use = {qid: data for qid, data in all_features.items() if qid in subset_qids}
+                qrels_to_use = {qid: data for qid, data in all_qrels.items() if qid in subset_qids}
+                runs_to_use = {qid: data for qid, data in all_runs.items() if qid in subset_qids}
+            else:
+                features_to_use, qrels_to_use, runs_to_use = all_features, all_qrels, all_runs
 
             validation_data = {
-                'features': features,
-                'queries': queries,
-                'qrels': qrels,
-                'documents': documents,
-                'first_stage_runs': dict(first_stage_runs)
+                'features': features_to_use,
+                'queries': queries_to_use,
+                'qrels': qrels_to_use,
+                'documents': all_documents,  # Keep all docs available
+                'first_stage_runs': dict(runs_to_use)
             }
-        logger.info(f"Successfully loaded data for {len(queries)} queries.")
+        logger.info(f"Successfully loaded and filtered data for {len(queries_to_use)} queries.")
 
-        # --- Initialize Components ---
+        # --- Initialize Components and Run Training ---
         reranker = MultiVectorReranker(model_name=args.semantic_model)
         trainer = WeightTrainer(reranker=reranker)
 
-        # --- Run Training ---
         optimal_weights = trainer.train(
             validation_data=validation_data,
             optimizer_type=args.optimizer,
@@ -266,14 +230,11 @@ def main():
         )
 
     except Exception as e:
-        logger.critical(f"A critical error occurred during the weight training process: {e}")
-        logger.critical(traceback.format_exc())
+        logger.critical(f"A critical error occurred during weight training: {e}", exc_info=True)
         sys.exit(1)
 
-    logger.info("=" * 60)
-    logger.info("WEIGHT TRAINING SCRIPT COMPLETED SUCCESSFULLY")
+    logger.info("=" * 60 + "\nWEIGHT TRAINING SCRIPT COMPLETED SUCCESSFULLY\n" + "=" * 60)
     logger.info(f"Optimal weights saved to: {weights_file_path}")
-    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
