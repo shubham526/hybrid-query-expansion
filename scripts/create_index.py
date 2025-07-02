@@ -29,7 +29,7 @@ from tqdm import tqdm
 # Import existing indexing infrastructure
 try:
     from src.core.bm25_scorer import BERTTokenBM25Indexer
-    from src.utils.initialize_lucene import initialize_lucene
+    from src.utils.lucene_utils import initialize_lucene
 
     INDEXER_AVAILABLE = True
 except ImportError as e:

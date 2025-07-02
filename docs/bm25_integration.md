@@ -86,7 +86,7 @@ python scripts/create_index.py \
 
 ```python
 from src.core.bm25_scorer import BERTTokenBM25Indexer
-from src.utils.initialize_lucene import initialize_lucene
+from src.utils.lucene_utils import initialize_lucene
 
 # Initialize Lucene JVM
 lucene_path = "/opt/lucene/jars/*"
@@ -95,6 +95,7 @@ if not initialize_lucene(lucene_path):
 
 # Load document collection
 import ir_datasets
+
 dataset = ir_datasets.load("msmarco-passage")
 documents = {doc.doc_id: doc.text for doc in dataset.docs_iter()}
 
@@ -115,7 +116,7 @@ print(f"Indexed {len(documents)} documents")
 
 ```python
 from src.core.bm25_scorer import TokenBM25Scorer
-from src.utils.initialize_lucene import initialize_lucene
+from src.utils.lucene_utils import initialize_lucene
 
 # Initialize Lucene
 initialize_lucene("/opt/lucene/jars/*")
@@ -157,20 +158,23 @@ print(f"Non-zero scores: {torch.nonzero(token_scores).numel()}")
 # train_weights.py integration (actual implementation)
 try:
     from src.core.bm25_scorer import TokenBM25Scorer
-    from src.utils.initialize_lucene import initialize_lucene
+    from src.utils.lucene_utils import initialize_lucene
+
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
+
 
 def initialize_bm25_scorer(index_path, lucene_path):
     """Initialize BM25 scorer if available."""
     if not BM25_AVAILABLE:
         return None
-    
+
     if not initialize_lucene(lucene_path):
         raise RuntimeError("Failed to initialize Lucene")
-    
+
     return TokenBM25Scorer(index_path)
+
 
 # Usage in training
 if args.index_path and args.lucene_path:
@@ -484,11 +488,12 @@ if not term_scores or all(score == 0.0 for score in term_scores.values()):
 ```python
 # Enable debug logging for BM25 components
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 
 # Test basic functionality
 from src.core.bm25_scorer import TokenBM25Scorer
-from src.utils.initialize_lucene import initialize_lucene
+from src.utils.lucene_utils import initialize_lucene
 
 # Step-by-step debugging
 print("1. Initializing Lucene...")
@@ -499,7 +504,7 @@ if success:
     print("2. Creating scorer...")
     scorer = TokenBM25Scorer("./indexes/msmarco-passage_bert-base-uncased")
     print("   Scorer created successfully")
-    
+
     print("3. Testing term scoring...")
     scores = scorer.compute_bm25_term_weight("7067032", ["machine"])
     print(f"   Scores: {scores}")

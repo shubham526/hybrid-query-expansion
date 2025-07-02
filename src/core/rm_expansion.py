@@ -1,287 +1,346 @@
 """
-RM (Relevance Model) Expansion Module
+RM (Relevance Model) Expansion Module - Lucene Backend
 
-Implements RM1 and RM3 query expansion algorithms based on Lavrenko & Croft (2001).
-Provides clean, reusable interface for pseudo-relevance feedback query expansion.
+Clean interface to Lucene-based RM1 and RM3 query expansion.
+Replaces the previous Python implementation with proven Java/Lucene code.
 
 Author: Your Name
 """
 
-import re
 import logging
+import json
+from typing import List, Tuple, Dict, Optional
 from collections import Counter, defaultdict
-from typing import List, Tuple, Dict, Optional, Set
-from math import log, exp
-
-try:
-    import nltk
-    from nltk.corpus import stopwords
-
-    NLTK_AVAILABLE = True
-except ImportError:
-    NLTK_AVAILABLE = False
+from pathlib import Path
+import numpy as np
+from src.utils.lucene_utils import get_lucene_classes
 
 logger = logging.getLogger(__name__)
 
 
-class RMExpansion:
-    """
-    Relevance Model (RM) query expansion implementation.
 
-    Supports both RM1 (expansion terms only) and RM3 (original query + expansion terms).
-    Based on Lavrenko & Croft (2001) relevance-based language models.
+class LuceneRM3Scorer:
+    """
+    Lucene-based RM3 implementation using PyJnius.
+    Direct translation of the Java relevanceModel() method.
     """
 
-    def __init__(self,
-                 stopwords: Optional[Set[str]] = None,
-                 min_term_length: int = 2,
-                 max_term_length: int = 20,
-                 remove_query_terms: bool = False,
-                 use_nltk_stopwords: bool = True,
-                 language: str = 'english'):
+    def __init__(self, index_path: str, k1: float = 1.2, b: float = 0.75):
         """
-        Initialize RM expansion with filtering parameters.
+        Initialize Lucene RM3 scorer.
 
         Args:
-            stopwords: Set of stopwords to filter out (None to use NLTK or fallback)
-            min_term_length: Minimum length for expansion terms
-            max_term_length: Maximum length for expansion terms
-            remove_query_terms: Whether to remove original query terms from expansion
-            use_nltk_stopwords: Whether to use NLTK stopwords (if available)
-            language: Language for NLTK stopwords (default: 'english')
-        """
-        self.min_term_length = min_term_length
-        self.max_term_length = max_term_length
-        self.remove_query_terms = remove_query_terms
-        self.language = language
-
-        # Initialize stopwords
-        if stopwords is not None:
-            self.stopwords = stopwords
-        elif use_nltk_stopwords and NLTK_AVAILABLE:
-            self.stopwords = self._get_nltk_stopwords(language)
-        else:
-            self.stopwords = self._get_fallback_stopwords()
-            if use_nltk_stopwords and not NLTK_AVAILABLE:
-                logger.warning("NLTK not available, using fallback stopwords. Install with: pip install nltk")
-
-        logger.debug(f"Initialized RMExpansion with {len(self.stopwords)} stopwords")
-
-    def _get_nltk_stopwords(self, language: str = 'english') -> Set[str]:
-        """
-        Get NLTK stopwords for specified language.
-
-        Args:
-            language: Language for stopwords (default: 'english')
-
-        Returns:
-            Set of stopwords
+            index_path: Path to Lucene index
+            k1: BM25 k1 parameter
+            b: BM25 b parameter
         """
         try:
-            # Try to get stopwords, download if necessary
-            try:
-                stop_words = set(stopwords.words(language))
-            except LookupError:
-                logger.info(f"Downloading NLTK stopwords for {language}...")
-                nltk.download('stopwords', quiet=True)
-                stop_words = set(stopwords.words(language))
+            self.index_path = index_path
 
-            logger.debug(f"Loaded {len(stop_words)} NLTK stopwords for {language}")
-            return stop_words
+            # Get Lucene classes lazily
+            classes = get_lucene_classes()
+            for name, cls in classes.items():
+                setattr(self, name, cls)
+
+            # Open index and setup searcher
+            directory = self.FSDirectory.open(self.Path.get(index_path))
+            self.reader = self.DirectoryReader.open(directory)
+            self.searcher = self.IndexSearcher(self.reader)
+            self.searcher.setSimilarity(self.BM25Similarity(k1, b))
+
+            # Setup analyzer (same as used for indexing)
+            self.analyzer = self.EnglishAnalyzer()
+
+            logger.info(f"LuceneRM3Scorer initialized with index: {index_path}")
 
         except Exception as e:
-            logger.warning(f"Failed to load NLTK stopwords: {e}. Using fallback stopwords.")
-            return self._get_fallback_stopwords()
+            logger.error(f"Error initializing LuceneRM3Scorer: {e}")
+            raise
 
-    def _get_fallback_stopwords(self) -> Set[str]:
-        """Get fallback English stopwords if NLTK is not available."""
-        return {
-            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-            'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-            'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those',
-            'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your',
-            'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she',
-            'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them', 'their',
-            'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'whose', 'this',
-            'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
-            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-            'should', 'could', 'can', 'may', 'might', 'must', 'shall', 'ought'
-        }
-
-    def tokenize(self, text: str) -> List[str]:
+    def compute_rm3_expansion(self,
+                              query: str,
+                              num_feedback_docs: int = 10,
+                              num_expansion_terms: int = 20,
+                              omit_query_terms: bool = False) -> List[Tuple[str, float]]:
         """
-        Tokenize text using simple regex-based approach.
-
-        Args:
-            text: Input text to tokenize
-
-        Returns:
-            List of filtered tokens
-        """
-        if not text or not isinstance(text, str):
-            return []
-
-        # Basic tokenization: extract alphabetic words
-        tokens = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-
-        # Apply filters
-        filtered_tokens = []
-        for token in tokens:
-            if (self.min_term_length <= len(token) <= self.max_term_length
-                    and token not in self.stopwords):
-                filtered_tokens.append(token)
-
-        return filtered_tokens
-
-    def expand_query(self,
-                     query: str,
-                     documents: List[str],
-                     scores: List[float],
-                     num_expansion_terms: int = 10,
-                     rm_type: str = "rm3") -> List[Tuple[str, float]]:
-        """
-        Expand query using RM1 or RM3 algorithm.
+        Compute RM3 query expansion using Lucene (direct translation of Java relevanceModel).
 
         Args:
             query: Original query string
-            documents: List of pseudo-relevant documents
-            scores: Relevance scores for each document
+            num_feedback_docs: Number of pseudo-relevant documents to use
+            num_expansion_terms: Number of expansion terms to return
+            omit_query_terms: If True, return RM1 (no original query terms)
+
+        Returns:
+            List of (term, weight) tuples sorted by weight (descending)
+        """
+        try:
+            logger.debug(f"Computing RM3 for query: '{query}'")
+
+            # Step 1: Build initial query and search (Java: booleanQuery = queryBuilder.toQuery(queryStr))
+            initial_query = self._build_boolean_query(query)
+            top_docs = self.searcher.search(initial_query, num_feedback_docs)
+
+            if top_docs.totalHits.value() == 0:
+                logger.warning(f"No documents found for query: {query}")
+                return []
+
+            logger.debug(f"Found {top_docs.totalHits.value()} documents for feedback")
+
+            # Step 2: Extract terms and compute RM3 weights (Java: relevanceModel logic)
+            term_weights = self._compute_rm3_weights(
+                query, top_docs.scoreDocs, omit_query_terms
+            )
+
+            # Step 3: Sort and return top terms (Java: allWordFreqs.sort + subList)
+            sorted_terms = sorted(term_weights.items(), key=lambda x: x[1], reverse=True)
+            result = sorted_terms[:num_expansion_terms]
+
+            logger.debug(f"RM3 expansion completed: {len(result)} terms")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in RM3 expansion: {e}")
+            return []
+
+    def _build_boolean_query(self, query_str: str):
+        """Build initial boolean query from query string (Java: queryBuilder.toQuery)."""
+        try:
+            query_terms = self._tokenize_query(query_str)
+
+            if not query_terms:
+                raise ValueError(f"No valid terms in query: {query_str}")
+
+            builder = self.BooleanQueryBuilder()
+
+            for term in query_terms:
+                term_query = self.TermQuery(self.Term("contents", term))
+                builder.add(term_query, self.BooleanClauseOccur.SHOULD)
+
+            return builder.build()
+
+        except Exception as e:
+            logger.error(f"Error building query: {e}")
+            raise
+
+    def _tokenize_query(self, query_str: str) -> List[str]:
+        """Tokenize query string using Lucene analyzer (Java: tokenizeQuery)."""
+        try:
+            tokens = []
+            token_stream = self.analyzer.tokenStream("contents", self.StringReader(query_str))
+            char_term_attr = token_stream.addAttribute(self.CharTermAttribute)
+
+            token_stream.reset()
+            while token_stream.incrementToken():
+                token = char_term_attr.toString()
+                tokens.append(token)
+
+            token_stream.end()
+            token_stream.close()
+
+            return tokens
+
+        except Exception as e:
+            logger.error(f"Error tokenizing query: {e}")
+            return query_str.lower().split()  # Fallback
+
+    def _compute_rm3_weights(self,
+                            query_str: str,
+                            score_docs,
+                            omit_query_terms: bool) -> Dict[str, float]:
+        """
+        Compute RM3 weights following the Java implementation exactly.
+        Direct translation of the Java relevanceModel() method.
+        """
+        try:
+            term_weights = defaultdict(float)
+
+            # Step 1: Add original query terms with weight 1.0 (Java: queryBuilder.addTokens(queryStr, 1.0f, wordFreq))
+            if not omit_query_terms:
+                query_tokens = self._tokenize_query(query_str)
+                for token in query_tokens:
+                    term_weights[token] = 1.0
+
+                logger.debug(f"Added {len(query_tokens)} query terms with weight 1.0")
+
+            # Step 2: Determine if we have log scores (Java: useLog detection)
+            use_log = any(score_doc.score < 0.0 for score_doc in score_docs)
+
+            # Step 3: Compute score normalizer (Java: normalizer computation)
+            normalizer = 0.0
+            for score_doc in score_docs:
+                if use_log:
+                    normalizer += np.exp(score_doc.score)
+                else:
+                    normalizer += score_doc.score
+
+            if use_log:
+                normalizer = np.log(normalizer) if normalizer > 0 else 1.0
+
+            # Step 4: Process each pseudo-relevant document (Java: for loop over scoreDoc)
+            for score_doc in score_docs:
+                # Compute document weight (Java: weight computation)
+                if use_log:
+                    doc_weight = score_doc.score - normalizer if normalizer > 0 else 0.0
+                else:
+                    doc_weight = score_doc.score / normalizer if normalizer > 0 else 0.0
+
+                # Get document content (Java: searcher.doc(score.doc).get(expansionField))
+                doc = self.searcher.doc(score_doc.doc)
+                doc_content = doc.get("contents")
+
+                if doc_content:
+                    # Tokenize document and add weighted terms (Java: queryBuilder.addTokens)
+                    self._add_document_terms(doc_content, doc_weight, term_weights)
+
+            logger.debug(f"Processed {len(score_docs)} documents, total terms: {len(term_weights)}")
+            return dict(term_weights)
+
+        except Exception as e:
+            logger.error(f"Error computing RM3 weights: {e}")
+            return {}
+
+    def _add_document_terms(self, doc_content: str, doc_weight: float, term_weights: Dict[str, float]):
+        """Add document terms to the relevance model (Java: addTokens method logic)."""
+        try:
+            # Tokenize document content (Java: analyzer.tokenStream)
+            doc_tokens = self._tokenize_document(doc_content)
+
+            if not doc_tokens:
+                return
+
+            # Count term frequencies
+            term_counts = Counter(doc_tokens)
+            doc_length = len(doc_tokens)
+
+            # Add weighted term frequencies (Java: wordFreqs.compute logic)
+            for term, count in term_counts.items():
+                term_prob = count / doc_length if doc_length > 0 else 0.0
+                # Java: wordFreqs.compute(token, (t, oldV) -> (oldV==null)? weight : oldV + weight)
+                term_weights[term] += doc_weight * term_prob
+
+        except Exception as e:
+            logger.debug(f"Error processing document: {e}")
+
+    def _tokenize_document(self, doc_content: str) -> List[str]:
+        """Tokenize document content using Lucene analyzer (Java: analyzer.tokenStream)."""
+        try:
+            tokens = []
+            token_stream = self.analyzer.tokenStream("contents", self.StringReader(doc_content))
+            char_term_attr = token_stream.addAttribute(self.CharTermAttribute)
+
+            token_stream.reset()
+            while token_stream.incrementToken() and len(tokens) < 1000:  # Limit for performance
+                token = char_term_attr.toString()
+                tokens.append(token)
+
+            token_stream.end()
+            token_stream.close()
+
+            return tokens
+
+        except Exception as e:
+            logger.debug(f"Error tokenizing document: {e}")
+            return []
+
+    def explain_expansion(self, query: str, num_feedback_docs: int = 10) -> Dict[str, any]:
+        """Return detailed information about the expansion process for debugging."""
+        try:
+            initial_query = self._build_boolean_query(query)
+            top_docs = self.searcher.search(initial_query, num_feedback_docs)
+
+            explanation = {
+                'query': query,
+                'query_terms': self._tokenize_query(query),
+                'num_feedback_docs': len(top_docs.scoreDocs),
+                'feedback_doc_scores': [score_doc.score for score_doc in top_docs.scoreDocs],
+                'use_log_scores': any(score_doc.score < 0.0 for score_doc in top_docs.scoreDocs),
+            }
+
+            return explanation
+
+        except Exception as e:
+            logger.error(f"Error creating expansion explanation: {e}")
+            return {'error': str(e)}
+
+    def __del__(self):
+        """Clean up Lucene resources."""
+        try:
+            if hasattr(self, 'reader'):
+                self.reader.close()
+        except Exception as e:
+            logger.error(f"Error closing Lucene reader: {e}")
+
+
+class RMExpansion:
+    """
+    Relevance Model (RM) query expansion using Lucene backend.
+
+    Provides RM1 and RM3 expansion using the proven Java implementation
+    via PyJnius integration.
+    """
+
+    def __init__(self, index_path: str, k1: float = 1.2, b: float = 0.75):
+        """
+        Initialize RM expansion with Lucene backend.
+
+        Args:
+            index_path: Path to Lucene index
+            k1: BM25 k1 parameter
+            b: BM25 b parameter
+        """
+        self.index_path = Path(index_path)
+
+        if not self.index_path.exists():
+            raise ValueError(f"Index path does not exist: {index_path}")
+
+        self.lucene_rm3 = LuceneRM3Scorer(str(self.index_path), k1, b)
+
+        logger.info(f"RMExpansion initialized with Lucene backend: {index_path}")
+
+    def expand_query(self,
+                     query: str,
+                     documents: List[str],  # Ignored - Lucene uses index
+                     scores: List[float],   # Ignored - Lucene computes scores
+                     num_expansion_terms: int = 10,
+                     rm_type: str = "rm3") -> List[Tuple[str, float]]:
+        """
+        Expand query using Lucene RM1 or RM3 algorithm.
+
+        Args:
+            query: Original query string
+            documents: Ignored (Lucene retrieves from index)
+            scores: Ignored (Lucene computes scores)
             num_expansion_terms: Number of expansion terms to return
             rm_type: "rm1" (expansion only) or "rm3" (query + expansion)
 
         Returns:
             List of (term, weight) tuples, sorted by weight (descending)
-
-        Raises:
-            ValueError: If documents and scores have different lengths
-            ValueError: If rm_type is not "rm1" or "rm3"
         """
-        if not documents or not scores:
-            logger.warning("No documents or scores provided for expansion")
-            return []
-
-        if len(documents) != len(scores):
-            raise ValueError(f"Documents ({len(documents)}) and scores ({len(scores)}) must have same length")
-
         if rm_type not in ["rm1", "rm3"]:
             raise ValueError(f"rm_type must be 'rm1' or 'rm3', got '{rm_type}'")
 
-        logger.debug(f"Expanding query '{query}' using {rm_type.upper()} with {len(documents)} documents")
+        logger.debug(f"Expanding query '{query}' using Lucene {rm_type.upper()}")
 
-        # Tokenize query
-        query_terms = self.tokenize(query)
-        logger.debug(f"Query terms: {query_terms}")
+        omit_query_terms = (rm_type == "rm1")
 
-        # Compute term weights using relevance model
-        term_weights = self._compute_relevance_model(
-            documents=documents,
-            scores=scores,
-            query_terms=query_terms if rm_type == "rm3" else None
-        )
+        try:
+            result = self.lucene_rm3.compute_rm3_expansion(
+                query=query,
+                num_feedback_docs=10,  # Standard number for TREC
+                num_expansion_terms=num_expansion_terms,
+                omit_query_terms=omit_query_terms
+            )
 
-        # Remove query terms if requested
-        if self.remove_query_terms:
-            for query_term in query_terms:
-                term_weights.pop(query_term, None)
+            logger.debug(f"Lucene {rm_type.upper()} expansion completed: {len(result)} terms")
+            return result
 
-        # Sort by weight and return top terms
-        sorted_terms = sorted(term_weights.items(), key=lambda x: x[1], reverse=True)
-        result = sorted_terms[:num_expansion_terms]
-
-        logger.debug(f"Expansion completed: {len(result)} terms")
-        return result
-
-    def _compute_relevance_model(self,
-                                 documents: List[str],
-                                 scores: List[float],
-                                 query_terms: Optional[List[str]] = None) -> Dict[str, float]:
-        """
-        Compute relevance model term weights.
-
-        Args:
-            documents: List of pseudo-relevant documents
-            scores: Document relevance scores
-            query_terms: Original query terms (for RM3, None for RM1)
-
-        Returns:
-            Dictionary mapping terms to their relevance model weights
-        """
-        # Normalize document scores to probabilities
-        doc_probs = self._normalize_scores_to_probabilities(scores)
-
-        # Initialize term weights
-        term_weights = defaultdict(float)
-
-        # Add original query terms with weight 1.0 (for RM3)
-        if query_terms:
-            for term in query_terms:
-                if term not in self.stopwords:
-                    term_weights[term] += 1.0
-
-        # Process each document
-        for doc_text, doc_prob in zip(documents, doc_probs):
-            if doc_prob <= 0:
-                continue
-
-            # Tokenize document
-            doc_tokens = self.tokenize(doc_text)
-            if not doc_tokens:
-                continue
-
-            # Compute term frequencies in this document
-            term_counts = Counter(doc_tokens)
-            doc_length = len(doc_tokens)
-
-            # Add weighted term frequencies to relevance model
-            for term, count in term_counts.items():
-                # P(term|doc) using maximum likelihood estimation
-                term_prob_in_doc = count / doc_length
-
-                # Weight by document probability: P(doc) * P(term|doc)
-                term_weights[term] += doc_prob * term_prob_in_doc
-
-        return dict(term_weights)
-
-    def _normalize_scores_to_probabilities(self, scores: List[float]) -> List[float]:
-        """
-        Normalize relevance scores to probability distribution.
-
-        Args:
-            scores: List of relevance scores
-
-        Returns:
-            List of normalized probabilities
-        """
-        if not scores:
+        except Exception as e:
+            logger.error(f"Lucene {rm_type} expansion failed: {e}")
             return []
 
-        # Check if scores are log probabilities (negative values)
-        use_log_scores = any(score < 0 for score in scores)
-
-        if use_log_scores:
-            # Convert log scores to probabilities
-            max_score = max(scores)
-            probs = [exp(score - max_score) for score in scores]
-            normalizer = sum(probs)
-
-            if normalizer > 0:
-                return [p / normalizer for p in probs]
-            else:
-                # Fallback to uniform distribution
-                return [1.0 / len(scores)] * len(scores)
-        else:
-            # Regular scores - normalize to sum to 1
-            total_score = sum(scores)
-
-            if total_score > 0:
-                return [score / total_score for score in scores]
-            else:
-                # Fallback to uniform distribution
-                return [1.0 / len(scores)] * len(scores)
-
     def get_expansion_statistics(self,
-                                 expansion_terms: List[Tuple[str, float]]) -> Dict[str, float]:
+                                 expansion_terms: List[Tuple[str, float]]) -> dict:
         """
         Compute statistics about expansion terms.
 
@@ -289,7 +348,7 @@ class RMExpansion:
             expansion_terms: List of (term, weight) tuples
 
         Returns:
-            Dictionary with statistics (mean_weight, std_weight, etc.)
+            Dictionary with statistics
         """
         if not expansion_terms:
             return {}
@@ -312,177 +371,107 @@ class RMExpansion:
 
         return stats
 
-    def set_stopwords_from_nltk(self, language: str = 'english'):
-        """
-        Update stopwords using NLTK for specified language.
-
-        Args:
-            language: Language for NLTK stopwords
-        """
-        if NLTK_AVAILABLE:
-            self.stopwords = self._get_nltk_stopwords(language)
-            self.language = language
-        else:
-            logger.warning("NLTK not available. Install with: pip install nltk")
-
-    def set_stopwords(self, stopwords: Set[str]):
-        """
-        Update the stopwords list.
-
-        Args:
-            stopwords: New set of stopwords
-        """
-        self.stopwords = stopwords
-        logger.debug(f"Updated stopwords list to {len(stopwords)} words")
-
-    def add_stopwords(self, additional_stopwords: Set[str]):
-        """
-        Add additional stopwords to the existing list.
-
-        Args:
-            additional_stopwords: Additional stopwords to add
-        """
-        self.stopwords.update(additional_stopwords)
-        logger.debug(f"Added {len(additional_stopwords)} stopwords, total: {len(self.stopwords)}")
+    def explain_expansion(self, query: str) -> dict:
+        """Get detailed information about expansion process."""
+        try:
+            return self.lucene_rm3.explain_expansion(query)
+        except Exception as e:
+            logger.error(f"Error explaining expansion: {e}")
+            return {'error': str(e)}
 
 
-def get_available_stopword_languages() -> List[str]:
+# Factory function
+def create_rm_expansion(index_path: str, **kwargs) -> RMExpansion:
     """
-    Get list of available languages for NLTK stopwords.
+    Create RM expansion with Lucene backend.
+
+    Args:
+        index_path: Path to Lucene index
+        **kwargs: Additional arguments for Lucene scorer
 
     Returns:
-        List of language codes, empty list if NLTK not available
+        RMExpansion instance with Lucene backend
     """
-    if not NLTK_AVAILABLE:
-        return []
-
-    try:
-        # Try to get the list, download if necessary
-        try:
-            languages = stopwords.fileids()
-        except LookupError:
-            nltk.download('stopwords', quiet=True)
-            languages = stopwords.fileids()
-
-        return sorted(languages)
-    except Exception as e:
-        logger.warning(f"Failed to get NLTK stopword languages: {e}")
-        return []
+    return RMExpansion(index_path, **kwargs)
 
 
-# Convenience functions for common usage patterns
+# Convenience functions
 def rm1_expansion(query: str,
-                  documents: List[str],
-                  scores: List[float],
+                  index_path: str,
                   num_terms: int = 10,
                   **kwargs) -> List[Tuple[str, float]]:
     """
-    Convenience function for RM1 expansion.
+    Convenience function for RM1 expansion using Lucene.
 
     Args:
         query: Query string
-        documents: Pseudo-relevant documents
-        scores: Document scores
+        index_path: Path to Lucene index
         num_terms: Number of expansion terms
         **kwargs: Additional arguments for RMExpansion
 
     Returns:
         List of (term, weight) tuples
     """
-    rm = RMExpansion(**kwargs)
-    return rm.expand_query(query, documents, scores, num_terms, rm_type="rm1")
+    rm = RMExpansion(index_path, **kwargs)
+    return rm.expand_query(query, [], [], num_terms, rm_type="rm1")
 
 
 def rm3_expansion(query: str,
-                  documents: List[str],
-                  scores: List[float],
+                  index_path: str,
                   num_terms: int = 10,
                   **kwargs) -> List[Tuple[str, float]]:
     """
-    Convenience function for RM3 expansion.
+    Convenience function for RM3 expansion using Lucene.
 
     Args:
         query: Query string
-        documents: Pseudo-relevant documents
-        scores: Document scores
+        index_path: Path to Lucene index
         num_terms: Number of expansion terms
         **kwargs: Additional arguments for RMExpansion
 
     Returns:
         List of (term, weight) tuples
     """
-    rm = RMExpansion(**kwargs)
-    return rm.expand_query(query, documents, scores, num_terms, rm_type="rm3")
+    rm = RMExpansion(index_path, **kwargs)
+    return rm.expand_query(query, [], [], num_terms, rm_type="rm3")
 
 
-# Example usage and testing
+# Example usage
 if __name__ == "__main__":
-    # Configure logging for example
     logging.basicConfig(level=logging.INFO)
 
-    # Check NLTK availability
-    print("NLTK Stopwords Integration Example")
-    print("=" * 40)
-    print(f"NLTK available: {NLTK_AVAILABLE}")
+    print("Lucene RM Expansion Example")
+    print("=" * 30)
 
-    if NLTK_AVAILABLE:
-        available_languages = get_available_stopword_languages()
-        print(f"Available stopword languages: {available_languages[:10]}...")  # Show first 10
-    print()
+    try:
+        # Example with actual index
+        index_path = "./your_index_path"  # Update this
+        rm = RMExpansion(index_path)
 
-    # Example usage
-    query = "machine learning algorithms"
+        query = "machine learning algorithms"
+        print(f"Query: {query}")
 
-    # Mock pseudo-relevant documents
-    documents = [
-        "Machine learning algorithms include supervised and unsupervised methods. Neural networks and decision trees are popular algorithms.",
-        "Deep learning neural networks have revolutionized machine learning. Convolutional networks excel at computer vision tasks.",
-        "Support vector machines and random forests are classical machine learning methods for classification tasks.",
-        "Supervised learning algorithms require labeled training data for classification and regression problems.",
-        "Unsupervised learning discovers hidden patterns in data without labels using clustering algorithms."
-    ]
+        # RM3 expansion
+        rm3_terms = rm.expand_query(query, [], [], num_expansion_terms=10, rm_type="rm3")
+        print(f"\nRM3 Expansion ({len(rm3_terms)} terms):")
+        for i, (term, weight) in enumerate(rm3_terms, 1):
+            print(f"  {i:2d}. {term:<15} {weight:.4f}")
 
-    # Mock relevance scores (higher = more relevant)
-    scores = [0.95, 0.87, 0.82, 0.78, 0.71]
+        # RM1 expansion
+        rm1_terms = rm.expand_query(query, [], [], num_expansion_terms=8, rm_type="rm1")
+        print(f"\nRM1 Expansion ({len(rm1_terms)} terms):")
+        for i, (term, weight) in enumerate(rm1_terms, 1):
+            print(f"  {i:2d}. {term:<15} {weight:.4f}")
 
-    print(f"Query: {query}")
-    print(f"Documents: {len(documents)}")
-    print()
+        # Statistics
+        stats = rm.get_expansion_statistics(rm3_terms)
+        print(f"\nExpansion Statistics:")
+        for key, value in stats.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
 
-    # Initialize RM expansion with NLTK stopwords
-    rm = RMExpansion(use_nltk_stopwords=True)
-    print(f"Using {len(rm.stopwords)} stopwords")
-
-    # Show some example stopwords
-    sample_stopwords = sorted(list(rm.stopwords))[:20]
-    print(f"Sample stopwords: {sample_stopwords}")
-    print()
-
-    # RM3 expansion
-    print("RM3 Expansion (query + expansion terms):")
-    rm3_terms = rm.expand_query(query, documents, scores, num_expansion_terms=10, rm_type="rm3")
-    for i, (term, weight) in enumerate(rm3_terms, 1):
-        print(f"{i:2d}. {term:<15} {weight:.4f}")
-    print()
-
-    # RM1 expansion
-    print("RM1 Expansion (expansion terms only):")
-    rm1_terms = rm.expand_query(query, documents, scores, num_expansion_terms=8, rm_type="rm1")
-    for i, (term, weight) in enumerate(rm1_terms, 1):
-        print(f"{i:2d}. {term:<15} {weight:.4f}")
-    print()
-
-    # Test different language (if available)
-    if NLTK_AVAILABLE and 'spanish' in get_available_stopword_languages():
-        print("Testing Spanish stopwords:")
-        rm_spanish = RMExpansion(use_nltk_stopwords=True, language='spanish')
-        print(f"Spanish stopwords count: {len(rm_spanish.stopwords)}")
-        spanish_sample = sorted(list(rm_spanish.stopwords))[:10]
-        print(f"Sample Spanish stopwords: {spanish_sample}")
-        print()
-
-    # Statistics
-    print("Expansion Statistics:")
-    stats = rm.get_expansion_statistics(rm3_terms)
-    for key, value in stats.items():
-        print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+    except Exception as e:
+        print(f"Example failed: {e}")
+        print("Make sure to update index_path to point to your Lucene index")

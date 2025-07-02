@@ -37,7 +37,7 @@ from src.utils.logging_utils import setup_experiment_logging, log_experiment_inf
 # Conditionally import BM25 infrastructure
 try:
     from src.core.bm25_scorer import TokenBM25Scorer
-    from src.utils.initialize_lucene import initialize_lucene
+    from src.utils.lucene_utils import initialize_lucene
 
     BM25_AVAILABLE = True
 except ImportError as e:
@@ -169,7 +169,6 @@ def main():
 
         # STEP 1: Initialize basic components (no reranker yet)
         with TimedOperation(logger, "Initializing core components"):
-            rm_expansion = RMExpansion()
             semantic_sim = SemanticSimilarity(model_name=args.semantic_model)
             bm25_scorer = None
             if args.index_path:
@@ -231,16 +230,17 @@ def main():
             )
 
         # STEP 4: Create evaluator and run evaluation
-        evaluator = ModelEvaluator(reranker, rm_expansion, semantic_sim, bm25_scorer)
+        evaluator = ModelEvaluator(reranker, semantic_sim, bm25_scorer)
 
         models_to_run = {}
         if args.run_ablation:
             logger.info("Creating all baseline and ablation models for a full study.")
-            models_to_run = create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)
+            models_to_run = create_baseline_comparison_models(args.index_path, semantic_sim, bm25_scorer,
+                                                              learned_weights)
         else:
             logger.info("Evaluating only the final trained model ('our_method').")
             models_to_run['our_method'] = \
-                create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)[
+                create_baseline_comparison_models(args.index_path, semantic_sim, bm25_scorer, learned_weights)[
                     'our_method']
 
         all_runs_for_eval = {'FirstStage': eval_data['first_stage_runs']}

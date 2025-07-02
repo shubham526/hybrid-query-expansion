@@ -4,16 +4,7 @@ import os
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 import ir_datasets
-
-# Fix import path
-try:
-    from src.evaluation.metrics import get_metric
-except ImportError:
-    # Fallback - define a simple get_metric function
-    def get_metric(qrel_file: str, run_file: str, metric: str) -> float:
-        """Fallback metric computation - replace with your actual implementation"""
-        logger.warning(f"Using fallback metric computation for {metric}")
-        return 0.0
+from src.evaluation.metrics import get_metric
 
 logger = logging.getLogger(__name__)
 

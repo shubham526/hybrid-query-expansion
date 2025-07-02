@@ -8,54 +8,12 @@ from transformers import AutoTokenizer
 import numpy as np
 from tqdm import tqdm
 import jnius_config
+from src.utils.lucene_utils import get_lucene_classes
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global variable to store Lucene classes
-_lucene_classes = None
-
-def setup_lucene(lucene_path: str):
-    """Setup JVM and Lucene classpath"""
-    jnius_config.set_classpath(lucene_path)
-
-def get_lucene_classes():
-    """Lazy load Lucene classes only when needed"""
-    global _lucene_classes
-    if _lucene_classes is None:
-        try:
-            from jnius import autoclass
-            _lucene_classes = {
-                'FSDirectory': autoclass('org.apache.lucene.store.FSDirectory'),
-                'Path': autoclass('java.nio.file.Paths'),
-                'Document': autoclass('org.apache.lucene.document.Document'),
-                'Field': autoclass('org.apache.lucene.document.Field'),
-                'TextField': autoclass('org.apache.lucene.document.TextField'),
-                'StringField': autoclass('org.apache.lucene.document.StringField'),
-                'StoredField': autoclass('org.apache.lucene.document.StoredField'),
-                'EnglishAnalyzer': autoclass('org.apache.lucene.analysis.en.EnglishAnalyzer'),
-                'IndexWriterConfig': autoclass('org.apache.lucene.index.IndexWriterConfig'),
-                'IndexWriter': autoclass('org.apache.lucene.index.IndexWriter'),
-                'FieldStore': autoclass('org.apache.lucene.document.Field$Store'),
-                'IndexReader': autoclass('org.apache.lucene.index.DirectoryReader'),
-                'IndexSearcher': autoclass('org.apache.lucene.search.IndexSearcher'),
-                'Term': autoclass('org.apache.lucene.index.Term'),
-                'TermQuery': autoclass('org.apache.lucene.search.TermQuery'),
-                'BooleanQuery' : autoclass('org.apache.lucene.search.BooleanQuery'),
-                'BooleanQueryBuilder' : autoclass('org.apache.lucene.search.BooleanQuery$Builder'),
-                'BooleanClause': autoclass('org.apache.lucene.search.BooleanClause'),
-                'BooleanClauseOccur': autoclass('org.apache.lucene.search.BooleanClause$Occur'),
-                'BM25Similarity' : autoclass('org.apache.lucene.search.similarities.BM25Similarity'),
-                'ConstantScoreQuery': autoclass('org.apache.lucene.search.ConstantScoreQuery'),
-                'DirectoryReader' : autoclass('org.apache.lucene.index.DirectoryReader'),
-                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute')
-
-            }
-        except Exception as e:
-            logger.error(f"Error loading Lucene classes: {e}")
-            raise
-    return _lucene_classes
 
 
 

@@ -36,7 +36,7 @@ from src.utils.logging_utils import setup_experiment_logging, log_experiment_inf
 # Conditionally import BM25 infrastructure
 try:
     from src.core.bm25_scorer import TokenBM25Scorer
-    from src.utils.initialize_lucene import initialize_lucene
+    from src.utils.lucene_utils import initialize_lucene
 
     BM25_AVAILABLE = True
 except ImportError as e:
@@ -168,7 +168,8 @@ def main():
     parser.add_argument('--query-ids-file', type=str, help='Optional path to a file with query IDs to process.')
     parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2', help='Sentence-transformer model.')
     parser.add_argument('--max-expansion-terms', type=int, default=20, help='Max expansion terms.')
-    parser.add_argument('--index-path', type=str, help='Path to BM25 index.')
+    parser.add_argument('--index-path', type=str, required=True,
+                        help='Path to the pre-built BM25 index (required for RM expansion).')
     parser.add_argument('--lucene-path', type=str, help='Path to Lucene JARs.')
     parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
@@ -180,7 +181,7 @@ def main():
 
     try:
         with TimedOperation(logger, "Initializing components"):
-            rm_expansion = RMExpansion()
+            rm_expansion = RMExpansion(args.index_path)
             semantic_sim = SemanticSimilarity(args.semantic_model)
             bm25_scorer = None
             if args.index_path:

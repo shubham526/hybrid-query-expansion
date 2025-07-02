@@ -404,9 +404,11 @@ from src.utils.logging_utils import setup_logging
 # Import BM25 scorer if available
 try:
     from src.core.bm25_scorer import TokenBM25Scorer
+
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate expansion model")
@@ -417,69 +419,69 @@ def main():
     parser.add_argument('--index_path', help='BM25 index path (optional)')
     parser.add_argument('--lucene_path', help='Lucene JAR path (optional)')
     parser.add_argument('--ablation_study', action='store_true', help='Run ablation study')
-    
+
     args = parser.parse_args()
-    
+
     # Setup logging
     setup_logging(log_level="INFO")
     logger = logging.getLogger(__name__)
-    
+
     # Load learned weights
     alpha, beta, gamma = load_learned_weights(args.weights_file)
     logger.info(f"Loaded weights: α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}")
-    
+
     # Initialize components
     rm_expansion = RMExpansion()
     semantic_sim = SemanticSimilarity(args.semantic_model)
-    
+
     bm25_scorer = None
     if args.index_path and BM25_AVAILABLE:
         if args.lucene_path:
-            from src.utils.initialize_lucene import initialize_lucene
+            from src.utils.lucene_utils import initialize_lucene
             initialize_lucene(args.lucene_path)
         bm25_scorer = TokenBM25Scorer(args.index_path)
         logger.info("BM25 scorer initialized")
-    
+
     # Load evaluation dataset
     logger.info(f"Loading dataset: {args.dataset}")
     dataset = ir_datasets.load(args.dataset)
-    
+
     queries = {q.query_id: q.text for q in dataset.queries_iter()}
     qrels = defaultdict(dict)
     for qrel in dataset.qrels_iter():
         qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
-    
+
     first_stage_runs = defaultdict(list)
     for scoreddoc in dataset.scoreddocs_iter():
         first_stage_runs[scoreddoc.query_id].append((scoreddoc.doc_id, scoreddoc.score))
-    
+
     logger.info(f"Loaded {len(queries)} queries, {len(qrels)} qrels")
-    
+
     # Initialize evaluator
     evaluator = TRECEvaluator(['ndcg_cut_10', 'ndcg_cut_100', 'map', 'recip_rank'])
-    
+
     # Evaluate baseline (first-stage)
     baseline_results = evaluator.evaluate_run(dict(first_stage_runs), dict(qrels))
     logger.info("Baseline evaluation completed")
-    
+
     # Evaluate with learned weights
     importance_weights_dict = compute_importance_weights(
         queries, dict(first_stage_runs), rm_expansion, semantic_sim, bm25_scorer,
         alpha=alpha, beta=beta, gamma=gamma
     )
-    
+
     # For this example, we'll just use first-stage runs with importance scoring
     # In practice, you'd integrate with your multi-vector reranker
     our_method_results = dict(first_stage_runs)  # Placeholder
     our_results = evaluator.evaluate_run(our_method_results, dict(qrels))
     logger.info("Our method evaluation completed")
-    
+
     # Compare results
     comparison = evaluator.compare_runs({
         'baseline': dict(first_stage_runs),
         'our_method': our_method_results
     }, dict(qrels), 'baseline')
-    
+
     # Save results
     output_dir = ensure_dir(args.output_dir)
     results = {
@@ -489,9 +491,9 @@ def main():
         'our_method_metrics': our_results,
         'comparison': comparison
     }
-    
+
     save_json(results, output_dir / 'evaluation_results.json')
-    
+
     # Print summary
     print("Evaluation Results:")
     print("=" * 50)
@@ -500,7 +502,7 @@ def main():
         ours = our_results[metric]
         improvement = ours - baseline
         print(f"{metric.upper():<12}: {baseline:.4f} → {ours:.4f} (+{improvement:.4f})")
-    
+
     # Run ablation study if requested
     if args.ablation_study:
         logger.info("Running ablation study...")
@@ -508,9 +510,9 @@ def main():
             queries, dict(qrels), dict(first_stage_runs),
             rm_expansion, semantic_sim, bm25_scorer, evaluator
         )
-        
+
         save_json(ablation_results, output_dir / 'ablation_results.json')
-        
+
         print("\nAblation Study Results:")
         print("=" * 50)
         print(f"{'Method':<15} {'nDCG@10':<10} {'MAP':<10}")
@@ -518,17 +520,20 @@ def main():
         for method, scores in ablation_results.items():
             print(f"{method:<15} {scores['ndcg_cut_10']:<10.4f} {scores['map']:<10.4f}")
 
-def compute_importance_weights(queries, first_stage_runs, rm_expansion, 
-                              semantic_sim, bm25_scorer, alpha, beta, gamma):
+
+def compute_importance_weights(queries, first_stage_runs, rm_expansion,
+                               semantic_sim, bm25_scorer, alpha, beta, gamma):
     """Compute importance weights for all queries."""
     # Implementation as shown above
     pass
 
-def run_ablation_study(queries, qrels, first_stage_runs, rm_expansion, 
-                      semantic_sim, bm25_scorer, evaluator):
+
+def run_ablation_study(queries, qrels, first_stage_runs, rm_expansion,
+                       semantic_sim, bm25_scorer, evaluator):
     """Run ablation study across different weight configurations."""
     # Implementation as shown above  
     pass
+
 
 if __name__ == "__main__":
     main()
