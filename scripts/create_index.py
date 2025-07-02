@@ -293,15 +293,15 @@ def main():
     # Required parameters
     parser.add_argument('--collection', type=str, required=True,
                         help='IR dataset collection name (e.g., msmarco-passage)')
-    parser.add_argument('--output_dir', type=str, required=True,
+    parser.add_argument('--output-dir', type=str, required=True,
                         help='Output directory for the index')
-    parser.add_argument('--lucene_path', type=str, required=True,
+    parser.add_argument('--lucene-path', type=str, required=True,
                         help='Path to Lucene JAR files')
 
     # Model parameters
-    parser.add_argument('--model_name', type=str, default='bert-base-uncased',
+    parser.add_argument('--model-name', type=str, default='bert-base-uncased',
                         help='HuggingFace model name for tokenization (default: bert-base-uncased)')
-    parser.add_argument('--max_length', type=int, default=512,
+    parser.add_argument('--max-length', type=int, default=512,
                         help='Maximum token length for documents (default: 512)')
 
     # BM25 parameters
@@ -311,7 +311,7 @@ def main():
                         help='BM25 b parameter (default: 0.75)')
 
     # Indexing parameters
-    parser.add_argument('--max_docs', type=int, default=None,
+    parser.add_argument('--max-docs', type=int, default=None,
                         help='Maximum number of documents to index (for testing)')
     parser.add_argument('--validate', action='store_true',
                         help='Validate index after creation')
@@ -319,7 +319,7 @@ def main():
                         help='Overwrite existing index')
 
     # Logging parameters
-    parser.add_argument('--log_level', type=str, default='INFO',
+    parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         help='Logging level')
 
