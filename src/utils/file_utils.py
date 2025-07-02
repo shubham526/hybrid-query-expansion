@@ -263,9 +263,12 @@ def save_training_data(training_data: Dict[str, Any], output_dir: Union[str, Pat
     logger.info(f"Saved complete training dataset to: {output_dir}")
 
 
+# In src/utils/file_utils.py
+
 def load_training_data(data_dir: Union[str, Path]) -> Dict[str, Any]:
     """
-    Load complete training dataset.
+    Load complete training dataset. Checks for compressed versions of files
+    like features and documents.
 
     Args:
         data_dir: Data directory
@@ -276,24 +279,32 @@ def load_training_data(data_dir: Union[str, Path]) -> Dict[str, Any]:
     data_dir = Path(data_dir)
     training_data = {}
 
-    # Load components if they exist
+    # Define the base filenames
     components = {
         'queries': 'queries.json',
         'qrels': 'qrels.json',
         'documents': 'documents.pkl',
         'features': 'features.json',
-        'expansion_terms': 'expansion_terms.json',
         'statistics': 'statistics.json',
         'metadata': 'metadata.json'
     }
 
-    for component, filename in components.items():
-        filepath = data_dir / filename
-        if filepath.exists():
-            if filename.endswith('.json'):
-                training_data[component] = load_json(filepath)
-            elif filename.endswith('.pkl'):
-                training_data[component] = load_pickle(filepath)
+    for component, base_filename in components.items():
+        filepath = data_dir / base_filename
+        compressed_filepath = data_dir / (base_filename + '.gz')
+
+        # Prioritize loading the compressed file if it exists
+        if compressed_filepath.exists():
+            final_path = compressed_filepath
+        elif filepath.exists():
+            final_path = filepath
+        else:
+            continue # Skip if neither file exists
+
+        if str(final_path).endswith('.json') or str(final_path).endswith('.json.gz'):
+            training_data[component] = load_json(final_path)
+        elif str(final_path).endswith('.pkl') or str(final_path).endswith('.pkl.gz'):
+            training_data[component] = load_pickle(final_path)
 
     logger.info(f"Loaded training dataset from: {data_dir}")
     return training_data

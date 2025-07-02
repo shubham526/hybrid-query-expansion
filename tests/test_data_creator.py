@@ -28,7 +28,7 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 # Import modules to test
-from utils.file_utils import save_training_data, load_training_data
+from src.utils.file_utils import save_training_data, load_training_data
 
 
 class MockBM25Scorer:
