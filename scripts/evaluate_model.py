@@ -112,12 +112,20 @@ class ModelEvaluator:
                 pseudo_relevant_scores=pseudo_scores,
                 reference_doc_id=reference_doc_id
             )
+            rm_terms = self.rm_expansion.expand_query(
+                query=query_text,
+                documents=pseudo_docs_text,
+                scores=pseudo_scores,
+                num_expansion_terms=20,
+                rm_type="rm3"
+            )
+            rm_terms_dict = dict(rm_terms)
 
             candidate_results = [(doc_id, documents.get(doc_id, ""), score) for doc_id, score in first_stage_runs[qid]]
 
             reranked_results = self.reranker.rerank(
                 query=query_text,
-                expansion_terms=[(term, 0) for term in importance_weights.keys()],
+                expansion_terms=[(term, rm_terms_dict.get(term, 0.0)) for term in importance_weights.keys()],
                 importance_weights=importance_weights,
                 candidate_results=candidate_results,
                 top_k=1000

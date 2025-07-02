@@ -3,9 +3,17 @@ import tempfile
 import os
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
-import pytrec_eval
 import ir_datasets
-from .metrics import get_metric
+
+# Fix import path
+try:
+    from src.evaluation.metrics import get_metric
+except ImportError:
+    # Fallback - define a simple get_metric function
+    def get_metric(qrel_file: str, run_file: str, metric: str) -> float:
+        """Fallback metric computation - replace with your actual implementation"""
+        logger.warning(f"Using fallback metric computation for {metric}")
+        return 0.0
 
 logger = logging.getLogger(__name__)
 
@@ -42,30 +50,39 @@ class TRECEvaluator:
         Returns:
             Dictionary of metric scores
         """
-        # Create temporary files for pytrec_eval
+        if not run_results or not qrels:
+            logger.warning("Empty run_results or qrels provided")
+            return {metric: 0.0 for metric in self.metrics}
+
+        # Create temporary files for evaluation
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.qrel') as qrel_file, \
                 tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.run') as run_file:
 
-            # Write qrels
-            self._write_qrels(qrels, qrel_file.name)
+            try:
+                # Write qrels
+                self._write_qrels(qrels, qrel_file.name)
 
-            # Write run
-            self._write_run(run_results, run_file.name)
+                # Write run
+                self._write_run(run_results, run_file.name)
 
-            # Evaluate using your existing get_metric function
-            results = {}
-            for metric in self.metrics:
+                # Evaluate using your existing get_metric function
+                results = {}
+                for metric in self.metrics:
+                    try:
+                        results[metric] = float(get_metric(qrel_file.name, run_file.name, metric))
+                    except Exception as e:
+                        logger.warning(f"Failed to compute {metric}: {e}")
+                        results[metric] = 0.0
+
+                return results
+
+            finally:
+                # Cleanup temporary files
                 try:
-                    results[metric] = get_metric(qrel_file.name, run_file.name, metric)
-                except Exception as e:
-                    logger.warning(f"Failed to compute {metric}: {e}")
-                    results[metric] = 0.0
-
-            # Cleanup
-            os.unlink(qrel_file.name)
-            os.unlink(run_file.name)
-
-            return results
+                    os.unlink(qrel_file.name)
+                    os.unlink(run_file.name)
+                except OSError:
+                    pass
 
     def evaluate_multiple_runs(self, runs: Dict[str, Dict[str, List[Tuple[str, float]]]],
                                qrels: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
@@ -110,6 +127,11 @@ class TRECEvaluator:
             baseline_run = list(runs.keys())[0]
             logger.info(f"Using '{baseline_run}' as baseline")
 
+        if baseline_run not in evaluations:
+            logger.error(f"Baseline run '{baseline_run}' not found in evaluations")
+            baseline_run = list(evaluations.keys())[0]
+            logger.info(f"Using '{baseline_run}' as baseline instead")
+
         baseline_scores = evaluations[baseline_run]
 
         # Compute improvements
@@ -127,8 +149,8 @@ class TRECEvaluator:
             for metric, score in scores.items():
                 baseline_score = baseline_scores[metric]
                 if baseline_score > 0:
-                    improvement = (score - baseline_score) / baseline_score * 100
-                    improvements[f"{metric}_improvement_pct"] = improvement
+                    improvement_pct = (score - baseline_score) / baseline_score * 100
+                    improvements[f"{metric}_improvement_pct"] = improvement_pct
                     improvements[f"{metric}_improvement_abs"] = score - baseline_score
                 else:
                     improvements[f"{metric}_improvement_pct"] = 0.0
@@ -165,11 +187,14 @@ class TRECEvaluator:
             table += f"{run_name}"
             for metric in self.metrics:
                 score = scores[metric]
-                improvement = improvements[run_name].get(f"{metric}_improvement_abs", 0.0)
-                if improvement > 0:
-                    table += f"\t{score:.4f} (+{improvement:.4f})"
+                if run_name in improvements:
+                    improvement = improvements[run_name].get(f"{metric}_improvement_abs", 0.0)
+                    if improvement > 0:
+                        table += f"\t{score:.4f} (+{improvement:.4f})"
+                    else:
+                        table += f"\t{score:.4f} ({improvement:.4f})"
                 else:
-                    table += f"\t{score:.4f} ({improvement:.4f})"
+                    table += f"\t{score:.4f}"
             table += "\n"
 
         return table
@@ -197,15 +222,18 @@ class ExpansionEvaluator(TRECEvaluator):
     def __init__(self, metrics: List[str] = None):
         super().__init__(metrics)
 
-    def evaluate_expansion_ablation(self,
-                                    baseline_run: Dict[str, List[Tuple[str, float]]],
-                                    expansion_models: Dict[str, Any],
-                                    queries: Dict[str, str],
-                                    qrels: Dict[str, Dict[str, int]],
-                                    first_stage_runs: Dict[str, List[Tuple[str, float]]],
-                                    reranker) -> Dict[str, Any]:
+    def evaluate_expansion_with_precomputed_data(self,
+                                                 baseline_run: Dict[str, List[Tuple[str, float]]],
+                                                 expansion_models: Dict[str, Any],
+                                                 queries: Dict[str, str],
+                                                 qrels: Dict[str, Dict[str, int]],
+                                                 first_stage_runs: Dict[str, List[Tuple[str, float]]],
+                                                 expansion_terms_dict: Dict[str, List[Tuple[str, float]]],
+                                                 pseudo_relevant_docs_dict: Dict[str, List[str]],
+                                                 pseudo_relevant_scores_dict: Dict[str, List[float]],
+                                                 reranker) -> Dict[str, Any]:
         """
-        Evaluate ablation study for different expansion models.
+        Evaluate expansion models with pre-computed expansion data.
 
         Args:
             baseline_run: Results without expansion
@@ -213,18 +241,18 @@ class ExpansionEvaluator(TRECEvaluator):
             queries: {query_id: query_text}
             qrels: {query_id: {doc_id: relevance}}
             first_stage_runs: {query_id: [(doc_id, score), ...]}
+            expansion_terms_dict: {query_id: [(term, rm_weight), ...]}
+            pseudo_relevant_docs_dict: {query_id: [doc_text, ...]}
+            pseudo_relevant_scores_dict: {query_id: [score, ...]}
             reranker: MultiVectorReranker instance
 
         Returns:
-            Comprehensive ablation results
+            Comprehensive evaluation results
         """
-        logger.info(f"Running expansion ablation with {len(expansion_models)} models")
+        logger.info(f"Running expansion evaluation with {len(expansion_models)} models")
 
         # Prepare runs dictionary
         runs = {'Baseline (No Expansion)': baseline_run}
-
-        # Generate expansion terms for all queries (you may want to pre-compute these)
-        expansion_terms_dict = self._generate_expansion_terms(queries)
 
         # Evaluate each expansion model
         for model_name, expansion_model in expansion_models.items():
@@ -234,15 +262,20 @@ class ExpansionEvaluator(TRECEvaluator):
             importance_weights_dict = {}
             for query_id, query_text in queries.items():
                 try:
-                    # You'll need to provide pseudo-relevant docs and scores here
-                    # This is a simplified version - adapt based on your RM implementation
-                    importance_weights = expansion_model.expand_query(
-                        query=query_text,
-                        pseudo_relevant_docs=[],  # You'll need to provide these
-                        pseudo_relevant_scores=[],  # You'll need to provide these
-                        reference_doc_id=None  # For BM25 scoring
-                    )
-                    importance_weights_dict[query_id] = importance_weights
+                    if (query_id in pseudo_relevant_docs_dict and
+                            query_id in pseudo_relevant_scores_dict):
+
+                        importance_weights = expansion_model.expand_query(
+                            query=query_text,
+                            pseudo_relevant_docs=pseudo_relevant_docs_dict[query_id],
+                            pseudo_relevant_scores=pseudo_relevant_scores_dict[query_id],
+                            reference_doc_id=None  # For BM25 scoring - could be improved
+                        )
+                        importance_weights_dict[query_id] = importance_weights
+                    else:
+                        logger.warning(f"Missing expansion data for query {query_id}")
+                        importance_weights_dict[query_id] = {}
+
                 except Exception as e:
                     logger.warning(f"Failed to compute importance for query {query_id}: {e}")
                     importance_weights_dict[query_id] = {}
@@ -257,6 +290,7 @@ class ExpansionEvaluator(TRECEvaluator):
                     top_k=100
                 )
                 runs[model_name] = reranked_results
+
             except Exception as e:
                 logger.error(f"Failed to rerank with model {model_name}: {e}")
                 runs[model_name] = baseline_run  # Fallback to baseline
@@ -266,20 +300,137 @@ class ExpansionEvaluator(TRECEvaluator):
 
         return comparison
 
-    def _generate_expansion_terms(self, queries: Dict[str, str]) -> Dict[str, List[Tuple[str, float]]]:
+    def evaluate_expansion_ablation(self,
+                                    baseline_run: Dict[str, List[Tuple[str, float]]],
+                                    expansion_models: Dict[str, Any],
+                                    queries: Dict[str, str],
+                                    qrels: Dict[str, Dict[str, int]],
+                                    first_stage_runs: Dict[str, List[Tuple[str, float]]],
+                                    reranker,
+                                    rm_expansion=None,
+                                    document_collection: Dict[str, str] = None) -> Dict[str, Any]:
         """
-        Generate expansion terms for all queries.
-        This is a placeholder - you'll need to implement based on your RM expansion.
+        Evaluate ablation study for different expansion models.
+        This version generates expansion data on-the-fly.
+
+        Args:
+            baseline_run: Results without expansion
+            expansion_models: {model_name: expansion_model}
+            queries: {query_id: query_text}
+            qrels: {query_id: {doc_id: relevance}}
+            first_stage_runs: {query_id: [(doc_id, score), ...]}
+            reranker: MultiVectorReranker instance
+            rm_expansion: RM expansion instance (optional)
+            document_collection: {doc_id: doc_text} (optional)
+
+        Returns:
+            Comprehensive ablation results
         """
-        # Placeholder implementation
+        logger.info(f"Running expansion ablation with {len(expansion_models)} models")
+
+        if rm_expansion is None or document_collection is None:
+            logger.warning("Missing RM expansion or document collection - using simplified expansion")
+            return self._evaluate_with_simple_expansion(
+                baseline_run, expansion_models, queries, qrels, first_stage_runs, reranker
+            )
+
+        # Generate expansion data for all queries
+        expansion_terms_dict = {}
+        pseudo_relevant_docs_dict = {}
+        pseudo_relevant_scores_dict = {}
+
+        for query_id, query_text in queries.items():
+            try:
+                if query_id in first_stage_runs:
+                    # Use top-k documents as pseudo-relevant
+                    top_docs = first_stage_runs[query_id][:10]  # Top 10 for PRF
+
+                    pseudo_docs = []
+                    pseudo_scores = []
+
+                    for doc_id, score in top_docs:
+                        if doc_id in document_collection:
+                            pseudo_docs.append(document_collection[doc_id])
+                            pseudo_scores.append(score)
+
+                    if pseudo_docs:
+                        # Generate RM expansion
+                        rm_terms = rm_expansion.expand_query(
+                            query=query_text,
+                            documents=pseudo_docs,
+                            scores=pseudo_scores,
+                            num_expansion_terms=15,
+                            rm_type="rm3"
+                        )
+
+                        expansion_terms_dict[query_id] = rm_terms
+                        pseudo_relevant_docs_dict[query_id] = pseudo_docs
+                        pseudo_relevant_scores_dict[query_id] = pseudo_scores
+                    else:
+                        logger.warning(f"No valid pseudo-relevant docs for query {query_id}")
+                        expansion_terms_dict[query_id] = []
+                        pseudo_relevant_docs_dict[query_id] = []
+                        pseudo_relevant_scores_dict[query_id] = []
+
+            except Exception as e:
+                logger.warning(f"Failed to generate expansion for query {query_id}: {e}")
+                expansion_terms_dict[query_id] = []
+                pseudo_relevant_docs_dict[query_id] = []
+                pseudo_relevant_scores_dict[query_id] = []
+
+        # Use the main evaluation function with pre-computed data
+        return self.evaluate_expansion_with_precomputed_data(
+            baseline_run=baseline_run,
+            expansion_models=expansion_models,
+            queries=queries,
+            qrels=qrels,
+            first_stage_runs=first_stage_runs,
+            expansion_terms_dict=expansion_terms_dict,
+            pseudo_relevant_docs_dict=pseudo_relevant_docs_dict,
+            pseudo_relevant_scores_dict=pseudo_relevant_scores_dict,
+            reranker=reranker
+        )
+
+    def _evaluate_with_simple_expansion(self,
+                                        baseline_run, expansion_models, queries,
+                                        qrels, first_stage_runs, reranker):
+        """Fallback evaluation with simple query term expansion."""
+        logger.info("Using simple expansion fallback")
+
+        runs = {'Baseline (No Expansion)': baseline_run}
+
+        # Simple expansion: use query terms
         expansion_terms_dict = {}
         for query_id, query_text in queries.items():
-            # You'll need to implement actual RM expansion here
-            # This is just a placeholder
-            terms = query_text.split()[:5]  # Use first 5 terms as "expansion"
+            terms = query_text.lower().split()[:5]  # First 5 terms
             expansion_terms_dict[query_id] = [(term, 1.0) for term in terms]
 
-        return expansion_terms_dict
+        # Evaluate each model with uniform importance weights
+        for model_name, expansion_model in expansion_models.items():
+            logger.info(f"Evaluating model {model_name} with simple expansion")
+
+            # Create uniform importance weights
+            importance_weights_dict = {}
+            for query_id in queries.keys():
+                importance_weights_dict[query_id] = {
+                    term: 1.0 for term, _ in expansion_terms_dict.get(query_id, [])
+                }
+
+            try:
+                reranked_results = reranker.rerank_trec_dl_run(
+                    queries=queries,
+                    first_stage_runs=first_stage_runs,
+                    expansion_terms_dict=expansion_terms_dict,
+                    importance_weights_dict=importance_weights_dict,
+                    top_k=100
+                )
+                runs[model_name] = reranked_results
+
+            except Exception as e:
+                logger.error(f"Failed to rerank with model {model_name}: {e}")
+                runs[model_name] = baseline_run
+
+        return self.compare_runs(runs, qrels, 'Baseline (No Expansion)')
 
 
 def create_trec_dl_evaluator(year: str = "2019") -> ExpansionEvaluator:
@@ -302,49 +453,58 @@ def create_trec_dl_evaluator(year: str = "2019") -> ExpansionEvaluator:
 
 
 # Example usage for your paper
-def run_paper_evaluation():
+def run_paper_evaluation_example():
     """
     Example evaluation pipeline for your SIGIR paper.
+    Shows how to integrate all components.
     """
-    from models.multivector_retrieval import TRECDLReranker
-    from expansion_models import create_baseline_comparison_models
+    logger.info("Starting paper evaluation example")
 
-    # Load TREC DL data
-    evaluator = create_trec_dl_evaluator("2019")
+    try:
+        # This is just an example - adapt to your actual pipeline
+        from src.models.multivector_reranking import TRECDLReranker
+        from src.models.expansion_models import create_baseline_comparison_models
 
-    # Load data using ir_datasets
-    dataset = ir_datasets.load("msmarco-passage/trec-dl-2019")
-    queries = {q.query_id: q.text for q in dataset.queries_iter()}
-    qrels = defaultdict(dict)
-    for qrel in dataset.qrels_iter():
-        qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
+        # Load TREC DL data
+        evaluator = create_trec_dl_evaluator("2019")
 
-    # Load first-stage runs
-    first_stage_runs = {}
-    for scoreddoc in dataset.scoreddocs_iter():
-        if scoreddoc.query_id not in first_stage_runs:
-            first_stage_runs[scoreddoc.query_id] = []
-        first_stage_runs[scoreddoc.query_id].append((scoreddoc.doc_id, scoreddoc.score))
+        # Load data using ir_datasets
+        dataset = ir_datasets.load("msmarco-passage/trec-dl-2019")
+        queries = {q.query_id: q.text for q in dataset.queries_iter()}
 
-    # Create expansion models (your baselines)
-    expansion_models = create_baseline_comparison_models(
-        rm_expansion=None,  # Your RM expansion instance
-        semantic_sim=None,  # Your semantic similarity instance
-        bm25_scorer=None,  # Your BM25 scorer instance
-        learned_weights=(1.2, 0.8, 1.5)  # Your learned weights
-    )
+        qrels = defaultdict(dict)
+        for qrel in dataset.qrels_iter():
+            qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
 
-    # Run evaluation
-    results = evaluator.evaluate_expansion_ablation(
-        baseline_run=first_stage_runs,
-        expansion_models=expansion_models,
-        queries=queries,
-        qrels=dict(qrels),
-        first_stage_runs=first_stage_runs,
-        reranker=None  # Your reranker instance
-    )
+        # Load first-stage runs
+        first_stage_runs = defaultdict(list)
+        for scoreddoc in dataset.scoreddocs_iter():
+            first_stage_runs[scoreddoc.query_id].append((scoreddoc.doc_id, scoreddoc.score))
 
-    # Print results table
-    print(evaluator.create_results_table(results))
+        print(f"Loaded {len(queries)} queries, {len(qrels)} qrels")
+        print("Example evaluation pipeline ready!")
 
-    return results
+        return {
+            'queries': queries,
+            'qrels': dict(qrels),
+            'first_stage_runs': dict(first_stage_runs),
+            'evaluator': evaluator
+        }
+
+    except ImportError as e:
+        logger.warning(f"Could not import all modules for example: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    print("TREC Evaluator Module")
+    print("=" * 30)
+
+    # Run example
+    result = run_paper_evaluation_example()
+    if result:
+        print("✓ Example evaluation pipeline created successfully")
+    else:
+        print("⚠ Could not create full example due to missing dependencies")

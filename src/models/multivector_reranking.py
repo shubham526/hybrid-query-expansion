@@ -41,10 +41,17 @@ class MultiVectorReranker:
         self.model_name = model_name
         self.max_query_vectors = max_query_vectors
 
-        # Load sentence transformer model
-        self.model = SentenceTransformer(model_name, device=device)
-        self.tokenizer = self.model.tokenizer
-        self.device = self.model.device
+        # Load sentence transformer model with error handling
+        try:
+            self.model = SentenceTransformer(model_name, device=device)
+            self.tokenizer = self.model.tokenizer
+            self.device = self.model.device
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {e}")
+            raise
+
+        # Cache for token embeddings to avoid repeated lookups
+        self._token_embedding_cache = {}
 
         logger.info(f"Multi-vector reranker initialized with {model_name} on {self.device}")
         logger.debug(f"Max query vectors: {max_query_vectors}")
@@ -67,11 +74,21 @@ class MultiVectorReranker:
         query_vectors = []
 
         # Step 1: Original query tokens (baseline importance = 1.0)
-        query_tokens = self.tokenizer.tokenize(query)
-        for token in query_tokens[:self.max_query_vectors // 2]:  # Reserve space for expansion
-            embedding = self._get_token_embedding(token)
-            if embedding is not None:
-                query_vectors.append(embedding)  # Baseline weight = 1.0
+        try:
+            query_tokens = self.tokenizer.tokenize(query)
+            for token in query_tokens[:self.max_query_vectors // 2]:  # Reserve space for expansion
+                embedding = self._get_token_embedding(token)
+                if embedding is not None:
+                    query_vectors.append(embedding)  # Baseline weight = 1.0
+        except Exception as e:
+            logger.warning(f"Error tokenizing query '{query}': {e}")
+            # Fallback: use sentence-level embedding
+            try:
+                query_embedding = self.model.encode([query], convert_to_tensor=True)[0]
+                query_vectors.append(query_embedding)
+            except Exception as e2:
+                logger.error(f"Failed to encode query as fallback: {e2}")
+                raise
 
         logger.debug(f"Added {len(query_vectors)} original query vectors")
 
@@ -87,33 +104,48 @@ class MultiVectorReranker:
             if importance_score <= 0:
                 continue  # Skip terms with no importance
 
-            # Map word to subword tokens (principled approach from your paper)
-            subword_tokens = self.tokenizer.tokenize(term)
+            try:
+                # Map word to subword tokens (principled approach from your paper)
+                subword_tokens = self.tokenizer.tokenize(term)
 
-            # Apply same importance score to all subwords of this term
-            for subword in subword_tokens:
-                if len(query_vectors) >= self.max_query_vectors:
-                    break
+                # Apply same importance score to all subwords of this term
+                for subword in subword_tokens:
+                    if len(query_vectors) >= self.max_query_vectors:
+                        break
 
-                embedding = self._get_token_embedding(subword)
-                if embedding is not None:
-                    # KEY CONTRIBUTION: Scale embedding by learned importance
-                    scaled_embedding = importance_score * embedding
-                    query_vectors.append(scaled_embedding)
-                    expansion_added += 1
+                    embedding = self._get_token_embedding(subword)
+                    if embedding is not None:
+                        # KEY CONTRIBUTION: Scale embedding by learned importance
+                        scaled_embedding = importance_score * embedding
+                        query_vectors.append(scaled_embedding)
+                        expansion_added += 1
+            except Exception as e:
+                logger.debug(f"Error processing expansion term '{term}': {e}")
+                continue
 
         logger.debug(f"Added {expansion_added} importance-weighted expansion vectors")
 
         if not query_vectors:
             # Fallback: return single query embedding
-            query_embedding = self.model.encode([query], convert_to_tensor=True)[0]
-            query_vectors = [query_embedding]
+            logger.warning("No query vectors created, using fallback sentence embedding")
+            try:
+                query_embedding = self.model.encode([query], convert_to_tensor=True)[0]
+                query_vectors = [query_embedding]
+            except Exception as e:
+                logger.error(f"Failed to create fallback query embedding: {e}")
+                # Last resort: create a zero vector
+                embedding_dim = self.model.get_sentence_embedding_dimension()
+                query_vectors = [torch.zeros(embedding_dim, device=self.device)]
 
         # Convert to tensor
-        query_tensor = torch.stack(query_vectors)
-        logger.debug(f"Created query representation: {query_tensor.shape}")
-
-        return query_tensor
+        try:
+            query_tensor = torch.stack(query_vectors)
+            logger.debug(f"Created query representation: {query_tensor.shape}")
+            return query_tensor
+        except Exception as e:
+            logger.error(f"Failed to stack query vectors: {e}")
+            # Return single vector as fallback
+            return query_vectors[0].unsqueeze(0)
 
     def _get_token_embedding(self, token: str) -> Optional[torch.Tensor]:
         """
@@ -125,13 +157,47 @@ class MultiVectorReranker:
         Returns:
             Token embedding tensor or None if token not found
         """
+        # Check cache first
+        if token in self._token_embedding_cache:
+            return self._token_embedding_cache[token]
+
         try:
             token_id = self.tokenizer.convert_tokens_to_ids([token])[0]
 
             if token_id != self.tokenizer.unk_token_id:
-                # Access the underlying token embeddings
-                embedding = self.model[0].auto_model.embeddings.word_embeddings.weight[token_id].detach()
-                return embedding
+                # Try multiple access patterns for different model architectures
+                embedding = None
+
+                # Method 1: Direct access to embeddings (works for most BERT-like models)
+                try:
+                    if hasattr(self.model, '_modules') and '0' in self.model._modules:
+                        auto_model = self.model[0].auto_model
+                        if hasattr(auto_model, 'embeddings') and hasattr(auto_model.embeddings, 'word_embeddings'):
+                            embedding = auto_model.embeddings.word_embeddings.weight[token_id].detach()
+                except (AttributeError, IndexError, KeyError):
+                    pass
+
+                # Method 2: Alternative access pattern
+                if embedding is None:
+                    try:
+                        if hasattr(self.model, 'auto_model'):
+                            auto_model = self.model.auto_model
+                            if hasattr(auto_model, 'embeddings'):
+                                embedding = auto_model.embeddings.word_embeddings.weight[token_id].detach()
+                    except (AttributeError, IndexError, KeyError):
+                        pass
+
+                # Method 3: Fallback to encoding single token
+                if embedding is None:
+                    try:
+                        embedding = self.model.encode([token], convert_to_tensor=True)[0]
+                    except Exception:
+                        pass
+
+                # Cache successful result
+                if embedding is not None:
+                    self._token_embedding_cache[token] = embedding
+                    return embedding
 
             return None
 
@@ -156,6 +222,16 @@ class MultiVectorReranker:
             return 0.0
 
         try:
+            # Ensure both tensors are on the same device
+            if query_vectors.device != doc_vectors.device:
+                doc_vectors = doc_vectors.to(query_vectors.device)
+
+            # Handle single vector case
+            if query_vectors.dim() == 1:
+                query_vectors = query_vectors.unsqueeze(0)
+            if doc_vectors.dim() == 1:
+                doc_vectors = doc_vectors.unsqueeze(0)
+
             # Compute all pairwise similarities
             # [num_q_vectors, num_d_vectors]
             similarities = torch.matmul(query_vectors, doc_vectors.transpose(0, 1))
@@ -186,11 +262,16 @@ class MultiVectorReranker:
             Document vectors [num_tokens, embedding_dim]
         """
         try:
+            # Handle empty document
+            if not document or not document.strip():
+                logger.debug("Empty document, using fallback embedding")
+                return self.model.encode([""], convert_to_tensor=True)
+
             # Tokenize document
             tokens = self.tokenizer.tokenize(document)[:max_length]
 
             if not tokens:
-                # Return single embedding for empty document
+                # Return single embedding for document that produces no tokens
                 return self.model.encode([document], convert_to_tensor=True)
 
             # Get embeddings for each token
@@ -202,6 +283,7 @@ class MultiVectorReranker:
 
             if not doc_vectors:
                 # Fallback to sentence-level embedding
+                logger.debug("No token embeddings found, using sentence-level embedding")
                 return self.model.encode([document], convert_to_tensor=True)
 
             return torch.stack(doc_vectors)
@@ -209,7 +291,13 @@ class MultiVectorReranker:
         except Exception as e:
             logger.warning(f"Error encoding document: {e}")
             # Fallback to sentence-level embedding
-            return self.model.encode([document], convert_to_tensor=True)
+            try:
+                return self.model.encode([document], convert_to_tensor=True)
+            except Exception as e2:
+                logger.error(f"Failed to encode document with fallback: {e2}")
+                # Last resort: return zero vector
+                embedding_dim = self.model.get_sentence_embedding_dimension()
+                return torch.zeros(1, embedding_dim, device=self.device)
 
     def rerank(self,
                query: str,
@@ -233,12 +321,18 @@ class MultiVectorReranker:
         if not candidate_results:
             return []
 
-        logger.info(f"Reranking {len(candidate_results)} candidates with importance-weighted multi-vector query")
+        logger.info(f"Reranking {len(candidate_results)} candidates with importance-weighted multi-vector query for query '{query}'")
 
-        # Create importance-weighted query representation
-        query_vectors = self.create_importance_weighted_query_vectors(
-            query, expansion_terms, importance_weights
-        )
+        try:
+            # Create importance-weighted query representation
+            query_vectors = self.create_importance_weighted_query_vectors(
+                query, expansion_terms, importance_weights
+            )
+        except Exception as e:
+            logger.error(f"Failed to create query vectors: {e}")
+            # Return candidates sorted by first-stage score as fallback
+            return [(doc_id, first_stage_score) for doc_id, _, first_stage_score in
+                   sorted(candidate_results, key=lambda x: x[2], reverse=True)[:top_k]]
 
         # Score all candidate documents
         reranked_scores = []
@@ -293,8 +387,15 @@ class MultiVectorReranker:
         ):
             logger.debug(f"Batch reranking query {i + 1}/{len(queries)}")
 
-            reranked = self.rerank(query, expansion_terms, importance_weights, candidates, top_k)
-            results.append(reranked)
+            try:
+                reranked = self.rerank(query, expansion_terms, importance_weights, candidates, top_k)
+                results.append(reranked)
+            except Exception as e:
+                logger.error(f"Error in batch reranking query {i}: {e}")
+                # Fallback: return first-stage ranking
+                fallback = [(doc_id, score) for doc_id, _, score in
+                           sorted(candidates, key=lambda x: x[2], reverse=True)[:top_k]]
+                results.append(fallback)
 
         return results
 
@@ -317,24 +418,37 @@ class MultiVectorReranker:
             'original_tokens': [],
             'expansion_tokens': [],
             'importance_scores': {},
-            'num_vectors': 0
+            'num_vectors': 0,
+            'model_info': self.get_model_info()
         }
 
-        # Original query tokens
-        query_tokens = self.tokenizer.tokenize(query)
-        explanation['original_tokens'] = query_tokens[:self.max_query_vectors // 2]
+        try:
+            # Original query tokens
+            query_tokens = self.tokenizer.tokenize(query)
+            explanation['original_tokens'] = query_tokens[:self.max_query_vectors // 2]
 
-        # Expansion tokens with importance
-        expansion_tokens = []
-        for term, rm_weight in expansion_terms:
-            importance_score = importance_weights.get(term, 0.0)
-            if importance_score > 0:
-                subword_tokens = self.tokenizer.tokenize(term)
-                expansion_tokens.extend(subword_tokens)
-                explanation['importance_scores'][term] = importance_score
+            # Expansion tokens with importance
+            expansion_tokens = []
+            for term, rm_weight in expansion_terms:
+                importance_score = importance_weights.get(term, 0.0)
+                if importance_score > 0:
+                    try:
+                        subword_tokens = self.tokenizer.tokenize(term)
+                        expansion_tokens.extend(subword_tokens)
+                        explanation['importance_scores'][term] = {
+                            'importance_score': importance_score,
+                            'rm_weight': rm_weight,
+                            'subword_tokens': subword_tokens
+                        }
+                    except Exception as e:
+                        logger.debug(f"Error explaining term '{term}': {e}")
 
-        explanation['expansion_tokens'] = expansion_tokens
-        explanation['num_vectors'] = len(explanation['original_tokens']) + len(expansion_tokens)
+            explanation['expansion_tokens'] = expansion_tokens
+            explanation['num_vectors'] = len(explanation['original_tokens']) + len(expansion_tokens)
+
+        except Exception as e:
+            logger.error(f"Error creating explanation: {e}")
+            explanation['error'] = str(e)
 
         return explanation
 
@@ -345,14 +459,27 @@ class MultiVectorReranker:
         Returns:
             Dictionary with model information
         """
-        return {
-            'model_name': self.model_name,
-            'embedding_dimension': self.model.get_sentence_embedding_dimension(),
-            'max_sequence_length': self.model.max_seq_length,
-            'max_query_vectors': self.max_query_vectors,
-            'device': str(self.device),
-            'reranking_mode': True
-        }
+        try:
+            return {
+                'model_name': self.model_name,
+                'embedding_dimension': self.model.get_sentence_embedding_dimension(),
+                'max_sequence_length': getattr(self.model, 'max_seq_length', 'Unknown'),
+                'max_query_vectors': self.max_query_vectors,
+                'device': str(self.device),
+                'reranking_mode': True,
+                'cache_size': len(self._token_embedding_cache)
+            }
+        except Exception as e:
+            logger.error(f"Error getting model info: {e}")
+            return {
+                'model_name': self.model_name,
+                'error': str(e)
+            }
+
+    def clear_cache(self):
+        """Clear the token embedding cache to free memory."""
+        self._token_embedding_cache.clear()
+        logger.info("Token embedding cache cleared")
 
 
 class TRECDLReranker:
@@ -387,29 +514,34 @@ class TRECDLReranker:
         Returns:
             Dictionary mapping query_id -> [(doc_id, score), ...]
         """
-        import ir_datasets
+        try:
+            import ir_datasets
 
-        logger.info(f"Loading TREC DL runs from {dataset_name}")
+            logger.info(f"Loading TREC DL runs from {dataset_name}")
 
-        dataset = ir_datasets.load(dataset_name)
-        runs = {}
+            dataset = ir_datasets.load(dataset_name)
+            runs = {}
 
-        for scoreddoc in dataset.scoreddocs_iter():
-            query_id = scoreddoc.query_id
-            doc_id = scoreddoc.doc_id
-            score = scoreddoc.score
+            for scoreddoc in dataset.scoreddocs_iter():
+                query_id = scoreddoc.query_id
+                doc_id = scoreddoc.doc_id
+                score = scoreddoc.score
 
-            if query_id not in runs:
-                runs[query_id] = []
+                if query_id not in runs:
+                    runs[query_id] = []
 
-            runs[query_id].append((doc_id, score))
+                runs[query_id].append((doc_id, score))
 
-        # Sort by score (descending) for each query
-        for query_id in runs:
-            runs[query_id].sort(key=lambda x: x[1], reverse=True)
+            # Sort by score (descending) for each query
+            for query_id in runs:
+                runs[query_id].sort(key=lambda x: x[1], reverse=True)
 
-        logger.info(f"Loaded runs for {len(runs)} queries")
-        return runs
+            logger.info(f"Loaded runs for {len(runs)} queries")
+            return runs
+
+        except Exception as e:
+            logger.error(f"Error loading TREC DL runs: {e}")
+            return {}
 
     @staticmethod
     def load_document_collection(dataset_name: str = "msmarco-passage") -> Dict[str, str]:
@@ -422,18 +554,23 @@ class TRECDLReranker:
         Returns:
             Dictionary mapping doc_id -> doc_text
         """
-        import ir_datasets
+        try:
+            import ir_datasets
 
-        logger.info(f"Loading document collection from {dataset_name}")
+            logger.info(f"Loading document collection from {dataset_name}")
 
-        dataset = ir_datasets.load(dataset_name)
-        docs = {}
+            dataset = ir_datasets.load(dataset_name)
+            docs = {}
 
-        for doc in dataset.docs_iter():
-            docs[doc.doc_id] = doc.text
+            for doc in dataset.docs_iter():
+                docs[doc.doc_id] = doc.text
 
-        logger.info(f"Loaded {len(docs):,} documents")
-        return docs
+            logger.info(f"Loaded {len(docs):,} documents")
+            return docs
+
+        except Exception as e:
+            logger.error(f"Error loading document collection: {e}")
+            return {}
 
     def rerank_trec_dl_run(self,
                            queries: Dict[str, str],
@@ -530,7 +667,6 @@ class TRECDLReranker:
         """
         import tempfile
         import os
-        from src.evaluation.metrics import get_metric
 
         results = {
             'original': {},
@@ -563,21 +699,31 @@ class TRECDLReranker:
                 rerank_run_file.flush()
 
                 # Evaluate using your get_metric function
-                for metric in metrics:
-                    try:
-                        # Evaluate original run
-                        orig_score = get_metric(qrel_file.name, orig_run_file.name, metric)
-                        results['original'][metric] = float(orig_score)
+                try:
+                    from src.evaluation.metrics import get_metric
 
-                        # Evaluate reranked run
-                        rerank_score = get_metric(qrel_file.name, rerank_run_file.name, metric)
-                        results['reranked'][metric] = float(rerank_score)
+                    for metric in metrics:
+                        try:
+                            # Evaluate original run
+                            orig_score = get_metric(qrel_file.name, orig_run_file.name, metric)
+                            results['original'][metric] = float(orig_score)
 
-                        # Compute improvement
-                        results['improvement'][metric] = results['reranked'][metric] - results['original'][metric]
+                            # Evaluate reranked run
+                            rerank_score = get_metric(qrel_file.name, rerank_run_file.name, metric)
+                            results['reranked'][metric] = float(rerank_score)
 
-                    except Exception as e:
-                        logger.warning(f"Failed to compute metric {metric}: {e}")
+                            # Compute improvement
+                            results['improvement'][metric] = results['reranked'][metric] - results['original'][metric]
+
+                        except Exception as e:
+                            logger.warning(f"Failed to compute metric {metric}: {e}")
+                            results['original'][metric] = 0.0
+                            results['reranked'][metric] = 0.0
+                            results['improvement'][metric] = 0.0
+
+                except ImportError:
+                    logger.error("Could not import get_metric function. Please implement evaluation.")
+                    for metric in metrics:
                         results['original'][metric] = 0.0
                         results['reranked'][metric] = 0.0
                         results['improvement'][metric] = 0.0
@@ -605,17 +751,22 @@ def create_trec_dl_evaluation_pipeline(model_name: str = 'all-MiniLM-L6-v2',
     Returns:
         Configured TREC DL reranker
     """
-    # Load document collection
-    document_collection = TRECDLReranker.load_document_collection("msmarco-passage")
+    try:
+        # Load document collection
+        document_collection = TRECDLReranker.load_document_collection("msmarco-passage")
 
-    # Initialize reranker
-    multivector_reranker = MultiVectorReranker(model_name)
+        # Initialize reranker
+        multivector_reranker = MultiVectorReranker(model_name)
 
-    # Create TREC DL reranker
-    trec_reranker = TRECDLReranker(multivector_reranker, document_collection)
+        # Create TREC DL reranker
+        trec_reranker = TRECDLReranker(multivector_reranker, document_collection)
 
-    logger.info(f"TREC DL {trec_dl_year} evaluation pipeline ready")
-    return trec_reranker
+        logger.info(f"TREC DL {trec_dl_year} evaluation pipeline ready")
+        return trec_reranker
+
+    except Exception as e:
+        logger.error(f"Failed to create TREC DL evaluation pipeline: {e}")
+        raise
 
 
 # Example usage with TREC DL evaluation
@@ -687,11 +838,11 @@ evaluation_results = reranker.evaluate_reranking(
     original_runs=runs,
     reranked_runs=reranked_runs,
     qrels=qrels,
-    metrics=['ndcg@10', 'ndcg@100', 'map']
+    metrics=['ndcg_cut_10', 'ndcg_cut_100', 'map']
 )
 
 print("Evaluation Results:")
-for metric in ['ndcg@10', 'ndcg@100', 'map']:
+for metric in ['ndcg_cut_10', 'ndcg_cut_100', 'map']:
     original = evaluation_results['original'][metric]
     reranked = evaluation_results['reranked'][metric]
     improvement = evaluation_results['improvement'][metric]

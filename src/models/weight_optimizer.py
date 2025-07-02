@@ -23,18 +23,18 @@ class WeightOptimizer(ABC):
 
     @abstractmethod
     def optimize_weights(self,
-                         training_data: Dict,
+                         training_data: Optional[Dict],
                          validation_queries: Dict[str, str],
                          validation_qrels: Dict[str, Dict[str, int]],
-                         evaluation_function: Callable) -> Tuple[float, float, float]:
+                         evaluation_function: Callable[[Tuple[float, float, float]], float]) -> Tuple[float, float, float]:
         """
         Learn optimal weights for importance combination.
 
         Args:
-            training_data: Training dataset with expansion features
-            validation_queries: query_id -> query_text
-            validation_qrels: query_id -> {doc_id: relevance}
-            evaluation_function: Function that evaluates weights and returns metric score
+            training_data: Training dataset with expansion features (can be None)
+            validation_queries: query_id -> query_text (not used by evaluation_function)
+            validation_qrels: query_id -> {doc_id: relevance} (not used by evaluation_function)
+            evaluation_function: Function that takes (alpha, beta, gamma) and returns metric score
 
         Returns:
             Optimal (alpha, beta, gamma) weights for (RM, BM25, semantic)
@@ -63,26 +63,29 @@ class LBFGSOptimizer(WeightOptimizer):
         self.bounds = bounds or [(0.1, 5.0), (0.1, 5.0), (0.1, 5.0)]
         self.max_iterations = max_iterations
         self.tolerance = tolerance
+        self.iterations = 0  # Track iterations for logging
 
         logger.info(f"L-BFGS-B optimizer initialized with bounds {self.bounds}")
 
     def optimize_weights(self,
-                         training_data: Dict,
+                         training_data: Optional[Dict],
                          validation_queries: Dict[str, str],
                          validation_qrels: Dict[str, Dict[str, int]],
-                         evaluation_function: Callable) -> Tuple[float, float, float]:
+                         evaluation_function: Callable[[Tuple[float, float, float]], float]) -> Tuple[float, float, float]:
         """
         Learn optimal weights using L-BFGS-B optimization.
 
         Args:
-            training_data: Training dataset (not used directly, passed to evaluation_function)
-            validation_queries: Validation queries
-            validation_qrels: Validation relevance judgments
-            evaluation_function: Function(weights, queries, qrels) -> metric_score
+            training_data: Training dataset (not used directly)
+            validation_queries: Validation queries (not used directly - evaluation_function handles this)
+            validation_qrels: Validation relevance judgments (not used directly)
+            evaluation_function: Function that takes (alpha, beta, gamma) and returns metric score
 
         Returns:
             Optimal (α, β, γ) weights
         """
+        self.iterations = 0
+        iteration_scores = []
 
         def objective(weights):
             """Objective function: negative metric (since we minimize)."""
@@ -93,8 +96,18 @@ class LBFGSOptimizer(WeightOptimizer):
                 return 1.0  # High penalty for negative weights
 
             try:
+                # Convert to tuple as expected by evaluation function
+                weights_tuple = (alpha, beta, gamma)
+
                 # Evaluate retrieval performance with these weights
-                metric_score = evaluation_function(weights, validation_queries, validation_qrels)
+                metric_score = evaluation_function(weights_tuple)
+
+                self.iterations += 1
+                iteration_scores.append((weights_tuple, metric_score))
+
+                if self.iterations % 5 == 0:
+                    logger.debug(f"Iteration {self.iterations}: weights={weights_tuple}, score={metric_score:.4f}")
+
                 return -metric_score  # Negative because scipy minimizes
             except Exception as e:
                 logger.warning(f"Error in objective function with weights {weights}: {e}")
@@ -103,32 +116,45 @@ class LBFGSOptimizer(WeightOptimizer):
         logger.info("Starting L-BFGS-B optimization...")
 
         # Evaluate baseline (equal weights)
-        baseline_score = evaluation_function([1.0, 1.0, 1.0], validation_queries, validation_qrels)
-        logger.info(f"Baseline performance (equal weights): {baseline_score:.4f}")
+        try:
+            baseline_score = evaluation_function((1.0, 1.0, 1.0))
+            logger.info(f"Baseline performance (equal weights): {baseline_score:.4f}")
+        except Exception as e:
+            logger.warning(f"Could not evaluate baseline: {e}")
+            baseline_score = 0.0
 
         # Run optimization
-        result = minimize(
-            objective,
-            x0=[1.0, 1.0, 1.0],  # Start with equal weights
-            bounds=self.bounds,  # Weight bounds
-            method='L-BFGS-B',
-            options={
-                'maxiter': self.max_iterations,
-                'ftol': self.tolerance
-            }
-        )
+        try:
+            result = minimize(
+                objective,
+                x0=[1.0, 1.0, 1.0],  # Start with equal weights
+                bounds=self.bounds,  # Weight bounds
+                method='L-BFGS-B',
+                options={
+                    'maxiter': self.max_iterations,
+                    'ftol': self.tolerance,
+                    'disp': False
+                }
+            )
 
-        optimal_weights = result.x
-        optimal_score = -result.fun
+            optimal_weights = tuple(result.x)
+            optimal_score = -result.fun
 
-        logger.info("L-BFGS-B optimization completed!")
-        logger.info(
-            f"Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
-        logger.info(f"Optimal score: {optimal_score:.4f}")
-        logger.info(f"Improvement: {optimal_score - baseline_score:+.4f}")
-        logger.info(f"Convergence: {result.success}, Iterations: {result.nit}")
+            logger.info("L-BFGS-B optimization completed!")
+            logger.info(f"Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
+            logger.info(f"Optimal score: {optimal_score:.4f}")
+            logger.info(f"Improvement: {optimal_score - baseline_score:+.4f}")
+            logger.info(f"Convergence: {result.success}, Iterations: {result.nit}")
 
-        return tuple(optimal_weights)
+            # Store iterations for external access
+            self.iterations = result.nit
+
+            return optimal_weights
+
+        except Exception as e:
+            logger.error(f"Optimization failed: {e}")
+            logger.info("Returning baseline weights (1.0, 1.0, 1.0)")
+            return (1.0, 1.0, 1.0)
 
 
 class GridSearchOptimizer(WeightOptimizer):
@@ -149,22 +175,23 @@ class GridSearchOptimizer(WeightOptimizer):
         """
         self.weight_ranges = weight_ranges or [[0.1, 3.0], [0.1, 3.0], [0.1, 3.0]]
         self.resolution = resolution
+        self.iterations = 0
 
         logger.info(f"Grid search optimizer initialized with ranges {self.weight_ranges}, resolution {resolution}")
 
     def optimize_weights(self,
-                         training_data: Dict,
+                         training_data: Optional[Dict],
                          validation_queries: Dict[str, str],
                          validation_qrels: Dict[str, Dict[str, int]],
-                         evaluation_function: Callable) -> Tuple[float, float, float]:
+                         evaluation_function: Callable[[Tuple[float, float, float]], float]) -> Tuple[float, float, float]:
         """
         Learn optimal weights using grid search.
 
         Args:
-            training_data: Training dataset
-            validation_queries: Validation queries
-            validation_qrels: Validation relevance judgments
-            evaluation_function: Function(weights, queries, qrels) -> metric_score
+            training_data: Training dataset (not used)
+            validation_queries: Validation queries (not used directly)
+            validation_qrels: Validation relevance judgments (not used directly)
+            evaluation_function: Function that takes (alpha, beta, gamma) and returns metric score
 
         Returns:
             Optimal (α, β, γ) weights
@@ -178,38 +205,45 @@ class GridSearchOptimizer(WeightOptimizer):
         total_combinations = len(α_values) * len(β_values) * len(γ_values)
         logger.info(f"Grid search over {total_combinations} combinations...")
 
-        best_weights = None
+        best_weights = (1.0, 1.0, 1.0)
         best_score = -np.inf
         evaluated = 0
 
-        for α in α_values:
-            for β in β_values:
-                for γ in γ_values:
-                    weights = [α, β, γ]
+        try:
+            for α in α_values:
+                for β in β_values:
+                    for γ in γ_values:
+                        weights_tuple = (α, β, γ)
 
-                    try:
-                        score = evaluation_function(weights, validation_queries, validation_qrels)
+                        try:
+                            score = evaluation_function(weights_tuple)
 
-                        if score > best_score:
-                            best_score = score
-                            best_weights = weights
-                            logger.debug(f"New best: weights={weights}, score={score:.4f}")
+                            if score > best_score:
+                                best_score = score
+                                best_weights = weights_tuple
+                                logger.debug(f"New best: weights={weights_tuple}, score={score:.4f}")
 
-                        evaluated += 1
-                        if evaluated % 100 == 0:
-                            logger.info(f"Evaluated {evaluated}/{total_combinations} combinations")
+                            evaluated += 1
+                            if evaluated % 100 == 0:
+                                logger.info(f"Evaluated {evaluated}/{total_combinations} combinations")
 
-                    except Exception as e:
-                        logger.warning(f"Error evaluating weights {weights}: {e}")
-                        continue
+                        except Exception as e:
+                            logger.warning(f"Error evaluating weights {weights_tuple}: {e}")
+                            continue
 
-        logger.info("Grid search completed!")
-        logger.info(
-            f"Best weights: alpha={best_weights[0]:.3f}, beta={best_weights[1]:.3f}, gamma={best_weights[2]:.3f}")
-        logger.info(f"Best score: {best_score:.4f}")
-        logger.info(f"Evaluated {evaluated}/{total_combinations} combinations")
+            self.iterations = evaluated
 
-        return tuple(best_weights)
+            logger.info("Grid search completed!")
+            logger.info(f"Best weights: alpha={best_weights[0]:.3f}, beta={best_weights[1]:.3f}, gamma={best_weights[2]:.3f}")
+            logger.info(f"Best score: {best_score:.4f}")
+            logger.info(f"Evaluated {evaluated}/{total_combinations} combinations")
+
+            return best_weights
+
+        except Exception as e:
+            logger.error(f"Grid search failed: {e}")
+            logger.info("Returning baseline weights (1.0, 1.0, 1.0)")
+            return (1.0, 1.0, 1.0)
 
 
 class RandomSearchOptimizer(WeightOptimizer):
@@ -233,23 +267,24 @@ class RandomSearchOptimizer(WeightOptimizer):
         self.bounds = bounds or [(0.1, 5.0), (0.1, 5.0), (0.1, 5.0)]
         self.num_samples = num_samples
         self.random_seed = random_seed
+        self.iterations = 0
 
         np.random.seed(random_seed)
         logger.info(f"Random search optimizer initialized with {num_samples} samples")
 
     def optimize_weights(self,
-                         training_data: Dict,
+                         training_data: Optional[Dict],
                          validation_queries: Dict[str, str],
                          validation_qrels: Dict[str, Dict[str, int]],
-                         evaluation_function: Callable) -> Tuple[float, float, float]:
+                         evaluation_function: Callable[[Tuple[float, float, float]], float]) -> Tuple[float, float, float]:
         """
         Learn optimal weights using random search.
 
         Args:
-            training_data: Training dataset
-            validation_queries: Validation queries
-            validation_qrels: Validation relevance judgments
-            evaluation_function: Function(weights, queries, qrels) -> metric_score
+            training_data: Training dataset (not used)
+            validation_queries: Validation queries (not used directly)
+            validation_qrels: Validation relevance judgments (not used directly)
+            evaluation_function: Function that takes (alpha, beta, gamma) and returns metric score
 
         Returns:
             Optimal (α, β, γ) weights
@@ -257,40 +292,48 @@ class RandomSearchOptimizer(WeightOptimizer):
 
         logger.info(f"Random search over {self.num_samples} samples...")
 
-        best_weights = None
+        best_weights = (1.0, 1.0, 1.0)
         best_score = -np.inf
         evaluated = 0
 
-        for i in range(self.num_samples):
-            # Sample random weights within bounds
-            weights = []
-            for (min_val, max_val) in self.bounds:
-                weight = np.random.uniform(min_val, max_val)
-                weights.append(weight)
+        try:
+            for i in range(self.num_samples):
+                # Sample random weights within bounds
+                α = np.random.uniform(self.bounds[0][0], self.bounds[0][1])
+                β = np.random.uniform(self.bounds[1][0], self.bounds[1][1])
+                γ = np.random.uniform(self.bounds[2][0], self.bounds[2][1])
 
-            try:
-                score = evaluation_function(weights, validation_queries, validation_qrels)
+                weights_tuple = (α, β, γ)
 
-                if score > best_score:
-                    best_score = score
-                    best_weights = weights
-                    logger.debug(f"New best: weights={weights}, score={score:.4f}")
+                try:
+                    score = evaluation_function(weights_tuple)
 
-                evaluated += 1
-                if evaluated % 200 == 0:
-                    logger.info(f"Evaluated {evaluated}/{self.num_samples} samples")
+                    if score > best_score:
+                        best_score = score
+                        best_weights = weights_tuple
+                        logger.debug(f"New best: weights={weights_tuple}, score={score:.4f}")
 
-            except Exception as e:
-                logger.warning(f"Error evaluating weights {weights}: {e}")
-                continue
+                    evaluated += 1
+                    if evaluated % 200 == 0:
+                        logger.info(f"Evaluated {evaluated}/{self.num_samples} samples")
 
-        logger.info("Random search completed!")
-        logger.info(
-            f"Best weights: alpha={best_weights[0]:.3f}, beta={best_weights[1]:.3f}, gamma={best_weights[2]:.3f}")
-        logger.info(f"Best score: {best_score:.4f}")
-        logger.info(f"Evaluated {evaluated}/{self.num_samples} samples")
+                except Exception as e:
+                    logger.warning(f"Error evaluating weights {weights_tuple}: {e}")
+                    continue
 
-        return tuple(best_weights)
+            self.iterations = evaluated
+
+            logger.info("Random search completed!")
+            logger.info(f"Best weights: alpha={best_weights[0]:.3f}, beta={best_weights[1]:.3f}, gamma={best_weights[2]:.3f}")
+            logger.info(f"Best score: {best_score:.4f}")
+            logger.info(f"Evaluated {evaluated}/{self.num_samples} samples")
+
+            return best_weights
+
+        except Exception as e:
+            logger.error(f"Random search failed: {e}")
+            logger.info("Returning baseline weights (1.0, 1.0, 1.0)")
+            return (1.0, 1.0, 1.0)
 
 
 def create_optimizer(optimizer_type: str = 'lbfgs', **kwargs) -> WeightOptimizer:
@@ -325,9 +368,8 @@ if __name__ == "__main__":
     print("Weight Optimizer Module Example")
     print("=" * 40)
 
-
     # Mock evaluation function for demonstration
-    def mock_evaluation_function(weights, queries, qrels):
+    def mock_evaluation_function(weights: Tuple[float, float, float]) -> float:
         """Mock evaluation that peaks around alpha=1.2, beta=0.8, gamma=1.5"""
         alpha, beta, gamma = weights
         target = np.array([1.2, 0.8, 1.5])
@@ -335,9 +377,8 @@ if __name__ == "__main__":
         distance = np.linalg.norm(current - target)
         return 0.7 - 0.1 * distance  # Mock nDCG score
 
-
     # Mock data
-    mock_training_data = {}
+    mock_training_data = None
     mock_queries = {"q1": "test query"}
     mock_qrels = {"q1": {"doc1": 1}}
 
@@ -350,8 +391,7 @@ if __name__ == "__main__":
     optimal_weights = lbfgs_optimizer.optimize_weights(
         mock_training_data, mock_queries, mock_qrels, mock_evaluation_function
     )
-    print(
-        f"   Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
+    print(f"   Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
     print()
 
     # Test Grid Search optimizer
@@ -360,8 +400,7 @@ if __name__ == "__main__":
     optimal_weights = grid_optimizer.optimize_weights(
         mock_training_data, mock_queries, mock_qrels, mock_evaluation_function
     )
-    print(
-        f"   Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
+    print(f"   Optimal weights: alpha={optimal_weights[0]:.3f}, beta={optimal_weights[1]:.3f}, gamma={optimal_weights[2]:.3f}")
     print()
 
     # Test Random Search optimizer

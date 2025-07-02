@@ -41,7 +41,6 @@ try:
     BM25_AVAILABLE = True
 except ImportError as e:
     logging.error(f"Failed to import from 'src'. Please run 'pip install -e .' from the project root. Error: {e}")
-    INDEXER_AVAILABLE = False
     TokenBM25Scorer = None
     initialize_lucene = None
     BM25_AVAILABLE = False

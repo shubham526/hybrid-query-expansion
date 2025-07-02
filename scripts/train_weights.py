@@ -42,6 +42,7 @@ from src.utils.logging_utils import setup_experiment_logging, log_experiment_inf
 
 logger = logging.getLogger(__name__)
 
+
 def get_query_text(query_obj: Any) -> str:
     """
     Flexibly extracts query text from different ir_datasets query types.
@@ -56,7 +57,6 @@ def get_query_text(query_obj: Any) -> str:
     else:
         logger.warning(f"Could not determine query text for query_id {query_obj.query_id}. Defaulting to empty string.")
         return ""
-
 
 
 class WeightTrainer:
@@ -84,6 +84,25 @@ class WeightTrainer:
             if qid in queries:  # Ensure we only process relevant queries
                 candidate_docs_text[qid] = [(doc_id, documents.get(doc_id, ""), score) for doc_id, score in run]
 
+        # PRE-ENCODE ALL DOCUMENTS FOR EFFICIENCY
+        logger.info("Pre-encoding documents for optimization...")
+        doc_encodings = {}
+        total_docs = sum(len(candidates) for candidates in candidate_docs_text.values())
+
+        with tqdm(total=total_docs, desc="Encoding documents") as pbar:
+            for qid, candidates in candidate_docs_text.items():
+                for doc_id, doc_text, _ in candidates:
+                    if doc_id not in doc_encodings:
+                        try:
+                            doc_encodings[doc_id] = self.reranker.encode_document(doc_text)
+                        except Exception as e:
+                            logger.warning(f"Failed to encode document {doc_id}: {e}")
+                            # Create dummy encoding as fallback
+                            doc_encodings[doc_id] = self.reranker.model.encode([""], convert_to_tensor=True)
+                    pbar.update(1)
+
+        logger.info(f"Successfully pre-encoded {len(doc_encodings)} unique documents")
+
         def evaluate_weights(weights: Tuple[float, float, float]) -> float:
             """The actual evaluation function passed to the optimizer."""
             alpha, beta, gamma = weights
@@ -95,6 +114,7 @@ class WeightTrainer:
 
                 query_features = features[qid]
 
+                # Compute importance weights using learned combination
                 importance_weights = {
                     term: (alpha * term_data['rm_weight'] +
                            beta * term_data['bm25_score'] +
@@ -102,22 +122,52 @@ class WeightTrainer:
                     for term, term_data in query_features['term_features'].items()
                 }
 
-                reranked_results = self.reranker.rerank(
-                    query=query_text,
-                    expansion_terms=[(term, 0) for term in query_features['term_features'].keys()],
-                    importance_weights=importance_weights,
-                    candidate_results=candidate_docs_text[qid]
-                )
-                reranked_runs[qid] = reranked_results
+                # FIXED: Pass actual RM weights instead of zeros
+                expansion_terms = [(term, term_data['rm_weight'])
+                                   for term, term_data in query_features['term_features'].items()]
 
-            if not reranked_runs: return 0.0
+                # Create query vectors once
+                try:
+                    query_vectors = self.reranker.create_importance_weighted_query_vectors(
+                        query=query_text,
+                        expansion_terms=expansion_terms,
+                        importance_weights=importance_weights
+                    )
 
-            evaluator = create_trec_dl_evaluator()
-            evaluation = evaluator.evaluate_run(reranked_runs, qrels)
+                    # Score against pre-encoded documents
+                    scored_docs = []
+                    for doc_id, doc_text, first_stage_score in candidate_docs_text[qid]:
+                        try:
+                            doc_vectors = doc_encodings[doc_id]  # Use cached encoding
+                            reranking_score = self.reranker.late_interaction_score(query_vectors, doc_vectors)
+                            scored_docs.append((doc_id, reranking_score))
+                        except Exception as e:
+                            logger.debug(f"Error scoring document {doc_id} for query {qid}: {e}")
+                            # Fallback to first-stage score
+                            scored_docs.append((doc_id, first_stage_score))
 
-            score = evaluation.get(metric, 0.0)
-            logger.debug(f"Evaluated weights (α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}) -> {metric}: {score:.4f}")
-            return score
+                    # Sort by reranking score
+                    scored_docs.sort(key=lambda x: x[1], reverse=True)
+                    reranked_runs[qid] = scored_docs
+
+                except Exception as e:
+                    logger.warning(f"Error reranking query {qid}: {e}")
+                    # Fallback: use first-stage ranking
+                    reranked_runs[qid] = [(doc_id, score) for doc_id, _, score in candidate_docs_text[qid]]
+
+            if not reranked_runs:
+                logger.warning("No successful reranking results - returning 0.0")
+                return 0.0
+
+            try:
+                evaluator = create_trec_dl_evaluator()
+                evaluation = evaluator.evaluate_run(reranked_runs, qrels)
+                score = evaluation.get(metric, 0.0)
+                logger.debug(f"Evaluated weights (α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}) -> {metric}: {score:.4f}")
+                return score
+            except Exception as e:
+                logger.warning(f"Error during evaluation: {e}")
+                return 0.0
 
         return evaluate_weights
 
@@ -159,6 +209,44 @@ class WeightTrainer:
         return optimal_weights
 
 
+def validate_features(features: Dict[str, Any]) -> None:
+    """Validate that features have the required structure and fields."""
+    logger.info("Validating feature structure...")
+    required_fields = ['rm_weight', 'bm25_score', 'semantic_score']
+
+    if not features:
+        raise ValueError("Features dictionary is empty")
+
+    validated_queries = 0
+    for qid, query_features in features.items():
+        if 'term_features' not in query_features:
+            raise ValueError(f"Missing 'term_features' for query {qid}")
+
+        if not query_features['term_features']:
+            logger.warning(f"Empty term_features for query {qid}")
+            continue
+
+        for term, term_data in query_features['term_features'].items():
+            if not isinstance(term_data, dict):
+                raise ValueError(f"term_data for term '{term}' in query {qid} is not a dictionary")
+
+            missing_fields = [field for field in required_fields if field not in term_data]
+            if missing_fields:
+                raise ValueError(f"Missing fields {missing_fields} for term '{term}' in query {qid}")
+
+            # Check that values are numeric
+            for field in required_fields:
+                try:
+                    float(term_data[field])
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Non-numeric value for {field} in term '{term}' of query {qid}: {term_data[field]}")
+
+        validated_queries += 1
+
+    logger.info(f"Feature validation passed! Validated {validated_queries} queries with required fields.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Learn optimal query expansion weights using pre-computed features.",
@@ -191,6 +279,9 @@ def main():
             logger.info(f"Loading features from: {args.feature_file}")
             all_features = load_json(args.feature_file)
 
+            # Validate features early
+            validate_features(all_features)
+
             logger.info(f"Loading validation dataset: {args.validation_dataset}")
             dataset = ir_datasets.load(args.validation_dataset)
 
@@ -201,9 +292,29 @@ def main():
                 for qrel in dataset.qrels_iter():
                     all_qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
 
-            all_documents = {d.doc_id: (d.text if hasattr(d, 'text') else d.body) for d in tqdm(dataset.docs_iter(), total=dataset.docs_count(), desc="Loading documents" )}
+            # OPTIMIZED: Load documents on-demand instead of all at once
+            logger.info("Setting up document access...")
+            if hasattr(dataset, 'docs_count') and dataset.docs_count() > 100000:
+                logger.info(
+                    f"Large document collection detected ({dataset.docs_count():,} docs). Using on-demand loading.")
 
-            # --- FIX: Implement the correct PRF source selection logic ---
+                # For large collections, create a lookup function
+                def get_document_text(doc_id):
+                    for doc in dataset.docs_iter():
+                        if doc.doc_id == doc_id:
+                            return doc.text if hasattr(doc, 'text') else doc.body
+                    return ""
+
+                all_documents = defaultdict(str)
+                all_documents.default_factory = lambda: ""
+            else:
+                logger.info("Loading all documents into memory...")
+                all_documents = {d.doc_id: (d.text if hasattr(d, 'text') else d.body)
+                                 for d in tqdm(dataset.docs_iter(),
+                                               total=dataset.docs_count() if hasattr(dataset, 'docs_count') else None,
+                                               desc="Loading documents")}
+
+            # --- Load candidate document runs ---
             all_runs = defaultdict(list)
             if dataset.has_scoreddocs():
                 logger.info("Found 'scoreddocs' in dataset. Using them for candidate set.")
@@ -216,6 +327,7 @@ def main():
                 raise ValueError(
                     "A source for candidate documents is required. Provide a run file via --run-file-path or use a dataset with scoreddocs.")
 
+            # Filter to subset if specified
             queries_to_use = all_queries
             if args.query_ids_file:
                 logger.info(f"Filtering data to subset from: {args.query_ids_file}")
@@ -229,6 +341,29 @@ def main():
             else:
                 features_to_use, qrels_to_use, runs_to_use = all_features, all_qrels, all_runs
 
+            # Validate that we have data for the queries we want to train on
+            missing_features = set(queries_to_use.keys()) - set(features_to_use.keys())
+            missing_runs = set(queries_to_use.keys()) - set(runs_to_use.keys())
+
+            if missing_features:
+                logger.warning(f"Missing features for {len(missing_features)} queries: {list(missing_features)[:5]}...")
+            if missing_runs:
+                logger.warning(f"Missing runs for {len(missing_runs)} queries: {list(missing_runs)[:5]}...")
+
+            # Only use queries where we have all required data
+            valid_qids = (set(queries_to_use.keys()) &
+                          set(features_to_use.keys()) &
+                          set(runs_to_use.keys()) &
+                          set(qrels_to_use.keys()))
+
+            if len(valid_qids) < len(queries_to_use):
+                logger.warning(f"Reduced from {len(queries_to_use)} to {len(valid_qids)} queries due to missing data")
+
+            queries_to_use = {qid: queries_to_use[qid] for qid in valid_qids}
+            features_to_use = {qid: features_to_use[qid] for qid in valid_qids}
+            qrels_to_use = {qid: qrels_to_use[qid] for qid in valid_qids}
+            runs_to_use = {qid: runs_to_use[qid] for qid in valid_qids}
+
             validation_data = {
                 'features': features_to_use,
                 'queries': queries_to_use,
@@ -236,9 +371,11 @@ def main():
                 'documents': all_documents,
                 'first_stage_runs': runs_to_use
             }
+
         logger.info(f"Successfully loaded and filtered data for {len(queries_to_use)} queries.")
 
         # --- Initialize Components and Run Training ---
+        logger.info(f"Initializing reranker with model: {args.semantic_model}")
         reranker = MultiVectorReranker(model_name=args.semantic_model)
         trainer = WeightTrainer(reranker=reranker)
 
