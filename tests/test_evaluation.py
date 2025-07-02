@@ -42,35 +42,31 @@ class TestTRECEvaluator(unittest.TestCase):
     """Test cases for TRECEvaluator functionality."""
 
     def setUp(self):
-        """Set up test fixtures."""
+        """Set up test fixtures with corrected data."""
         self.temp_dir = tempfile.mkdtemp()
 
-        # Sample test data
-        self.sample_run_results = {
-            'query1': [('doc1', 0.9), ('doc2', 0.8), ('doc3', 0.7)],
-            'query2': [('doc4', 0.95), ('doc5', 0.85), ('doc6', 0.75)],
-            'query3': [('doc7', 0.88), ('doc8', 0.78), ('doc9', 0.68)]
-        }
-
+        # Qrels: query1 has two relevant docs (doc1=2, doc2=1)
         self.sample_qrels = {
             'query1': {'doc1': 2, 'doc2': 1, 'doc3': 0},
             'query2': {'doc4': 2, 'doc5': 0, 'doc6': 1},
-            'query3': {'doc7': 1, 'doc8': 2, 'doc9': 0}
         }
 
-        # Multiple runs for comparison
+        # Corrected Run Data:
+        # The 'baseline' now has a suboptimal ranking for query1, while
+        # 'improved' has the optimal ranking. This creates a real score difference.
         self.sample_runs = {
             'baseline': {
-                'query1': [('doc1', 0.8), ('doc2', 0.7), ('doc3', 0.6)],
-                'query2': [('doc4', 0.85), ('doc5', 0.75), ('doc6', 0.65)],
-                'query3': [('doc7', 0.78), ('doc8', 0.68), ('doc9', 0.58)]
+                'query1': [('doc2', 0.8), ('doc3', 0.7), ('doc1', 0.6)],  # doc1 is ranked last
+                'query2': [('doc4', 0.85), ('doc6', 0.75), ('doc5', 0.65)],
             },
             'improved': {
-                'query1': [('doc1', 0.9), ('doc2', 0.8), ('doc3', 0.7)],
-                'query2': [('doc4', 0.95), ('doc5', 0.85), ('doc6', 0.75)],
-                'query3': [('doc7', 0.88), ('doc8', 0.78), ('doc9', 0.68)]
+                'query1': [('doc1', 0.9), ('doc2', 0.8), ('doc3', 0.7)],  # doc1 is ranked first
+                'query2': [('doc4', 0.95), ('doc6', 0.85), ('doc5', 0.75)],
             }
         }
+
+        # The single run uses the 'improved' data
+        self.sample_run_results = self.sample_runs['improved']
 
     def tearDown(self):
         """Clean up test fixtures."""
@@ -152,85 +148,52 @@ class TestTRECEvaluator(unittest.TestCase):
 
     @unittest.skipUnless(EVALUATOR_AVAILABLE, "Evaluator modules not available")
     def test_single_run_evaluation(self):
-        """Test evaluation of a single run."""
+        """Test evaluation of a single run against the true calculated value."""
         evaluator = TRECEvaluator(metrics=['map'])
+        results = evaluator.evaluate_run(self.sample_run_results, self.sample_qrels)
 
-        # Mock the get_metric function to avoid dependency on pytrec_eval
-        with patch('src.evaluation.metrics.get_metric') as mock_get_metric:
-            mock_get_metric.return_value = 0.75  # Mock MAP score
-
-            results = evaluator.evaluate_run(self.sample_run_results, self.sample_qrels)
-
-            # Should return results dict
-            self.assertIsInstance(results, dict)
-            self.assertIn('map', results)
-            self.assertEqual(results['map'], 0.75)
-
-            # get_metric should have been called
-            self.assertTrue(mock_get_metric.called)
+        # Assert against the real MAP score for the 'improved' run data
+        # MAP for query1 = (1/1 + 2/2) / 2 = 1.0
+        # MAP for query2 = (1/1 + 2/2) / 2 = 1.0
+        # Average MAP = (1.0 + 1.0) / 2 = 1.0
+        self.assertIsInstance(results, dict)
+        self.assertIn('map', results)
+        self.assertAlmostEqual(results['map'], 1.0, places=4)
 
     @unittest.skipUnless(EVALUATOR_AVAILABLE, "Evaluator modules not available")
     def test_multiple_runs_evaluation(self):
-        """Test evaluation of multiple runs."""
-        evaluator = TRECEvaluator(metrics=['map', 'ndcg_cut_10'])
+        """Test evaluation of multiple runs against true calculated values."""
+        evaluator = TRECEvaluator(metrics=['map'])
+        results = evaluator.evaluate_multiple_runs(self.sample_runs, self.sample_qrels)
 
-        # Mock the get_metric function
-        def mock_get_metric_side_effect(qrels_file, run_file, metric):
-            if 'baseline' in run_file:
-                return 0.60 if metric == 'map' else 0.55
-            else:  # improved run
-                return 0.75 if metric == 'map' else 0.70
+        self.assertIsInstance(results, dict)
+        self.assertIn('baseline', results)
+        self.assertIn('improved', results)
 
-        with patch('src.evaluation.metrics.get_metric') as mock_get_metric:
-            mock_get_metric.side_effect = mock_get_metric_side_effect
+        # Assert against real MAP for the 'baseline' run
+        # MAP for query1 = (1/1 + 2/3) / 2 = (1 + 0.666) / 2 = 0.8333
+        # MAP for query2 = (1/1 + 2/2) / 2 = 1.0
+        # Average MAP = (0.8333 + 1.0) / 2 = 0.9167
+        self.assertAlmostEqual(results['baseline']['map'], 0.9167, places=4)
 
-            results = evaluator.evaluate_multiple_runs(self.sample_runs, self.sample_qrels)
-
-            # Should return results for both runs
-            self.assertIsInstance(results, dict)
-            self.assertIn('baseline', results)
-            self.assertIn('improved', results)
-
-            # Check baseline results
-            baseline_results = results['baseline']
-            self.assertEqual(baseline_results['map'], 0.60)
-            self.assertEqual(baseline_results['ndcg_cut_10'], 0.55)
-
-            # Check improved results
-            improved_results = results['improved']
-            self.assertEqual(improved_results['map'], 0.75)
-            self.assertEqual(improved_results['ndcg_cut_10'], 0.70)
+        # Assert against real MAP for the 'improved' run
+        self.assertAlmostEqual(results['improved']['map'], 1.0, places=4)
 
     @unittest.skipUnless(EVALUATOR_AVAILABLE, "Evaluator modules not available")
     def test_runs_comparison(self):
-        """Test comparison of multiple runs."""
+        """Test comparison of multiple runs against true calculated improvements."""
         evaluator = TRECEvaluator(metrics=['map'])
+        comparison = evaluator.compare_runs(self.sample_runs, self.sample_qrels, 'baseline')
 
-        # Mock the get_metric function
-        def mock_get_metric_side_effect(qrels_file, run_file, metric):
-            if 'baseline' in run_file:
-                return 0.60
-            else:  # improved run
-                return 0.75
+        self.assertIsInstance(comparison, dict)
+        self.assertEqual(comparison['baseline'], 'baseline')
+        self.assertIn('improvements', comparison)
 
-        with patch('src.evaluation.metrics.get_metric') as mock_get_metric:
-            mock_get_metric.side_effect = mock_get_metric_side_effect
+        improvements = comparison['improvements']['improved']
 
-            comparison = evaluator.compare_runs(self.sample_runs, self.sample_qrels, 'baseline')
-
-            # Should return comparison results
-            self.assertIsInstance(comparison, dict)
-            self.assertIn('evaluations', comparison)
-            self.assertIn('baseline', comparison)
-            self.assertIn('improvements', comparison)
-
-            # Check baseline identification
-            self.assertEqual(comparison['baseline'], 'baseline')
-
-            # Check improvements calculation
-            improvements = comparison['improvements']['improved']
-            self.assertAlmostEqual(improvements['map_improvement_pct'], 25.0, delta=0.1)  # (0.75-0.60)/0.60*100
-            self.assertAlmostEqual(improvements['map_improvement_abs'], 0.15, delta=0.01)
+        # Real improvement: (1.0 - 0.9167) / 0.9167 * 100 = 9.09%
+        self.assertAlmostEqual(improvements['map_improvement_abs'], 1.0 - 0.9167, delta=0.0001)
+        self.assertAlmostEqual(improvements['map_improvement_pct'], 9.09, delta=0.01)
 
     @unittest.skipUnless(EVALUATOR_AVAILABLE, "Evaluator modules not available")
     def test_results_table_creation(self):
