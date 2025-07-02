@@ -195,7 +195,7 @@ class TestRMExpansion(unittest.TestCase):
 
     def test_empty_input_handling(self):
         """Test handling of empty inputs."""
-        # Empty documents
+        # Empty documents should return an empty list
         expansion_empty_docs = self.rm_expansion.expand_query(
             query=self.sample_query,
             documents=[],
@@ -205,7 +205,7 @@ class TestRMExpansion(unittest.TestCase):
         )
         self.assertEqual(len(expansion_empty_docs), 0)
 
-        # Empty query
+        # Empty query should still run and return a list (possibly empty)
         expansion_empty_query = self.rm_expansion.expand_query(
             query="",
             documents=self.sample_documents,
@@ -213,19 +213,18 @@ class TestRMExpansion(unittest.TestCase):
             num_expansion_terms=5,
             rm_type="rm3"
         )
-        # Should still work but return fewer/different terms
         self.assertIsInstance(expansion_empty_query, list)
 
-        # Mismatched documents and scores
-        expansion_mismatched = self.rm_expansion.expand_query(
-            query=self.sample_query,
-            documents=self.sample_documents,
-            scores=[0.9, 0.8],  # Fewer scores than documents
-            num_expansion_terms=5,
-            rm_type="rm3"
-        )
-        # Should handle gracefully
-        self.assertIsInstance(expansion_mismatched, list)
+        # Mismatched documents and scores should raise a ValueError
+        # This is the corrected part of the test.
+        with self.assertRaises(ValueError):
+            self.rm_expansion.expand_query(
+                query=self.sample_query,
+                documents=self.sample_documents,  # 5 documents
+                scores=[0.9, 0.8],  # 2 scores
+                num_expansion_terms=5,
+                rm_type="rm3"
+            )
 
     def test_weight_computation_consistency(self):
         """Test that weight computation is consistent and deterministic."""
