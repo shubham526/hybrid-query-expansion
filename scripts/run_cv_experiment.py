@@ -48,20 +48,20 @@ def main():
     parser = argparse.ArgumentParser(description="Run a k-fold cross-validation experiment.")
     # --- Experiment Setup ---
     parser.add_argument('--experiment_name', type=str, required=True, help="A name for this experiment run.")
-    parser.add_argument('--index_path', type=str, required=True,
+    parser.add_argument('--index-path', type=str, required=True,
                         help="Path to the pre-built BM25 index for the full collection.")
-    parser.add_argument('--lucene_path', type=str, required=True, help="Path to Lucene JAR files.")
+    parser.add_argument('--lucene-path', type=str, required=True, help="Path to Lucene JAR files.")
 
     # --- Fold Definition (Choose ONE) ---
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--dataset_pattern', type=str,
+    group.add_argument('--dataset-pattern', type=str,
                        help="Pattern for ir_datasets with folds, e.g., 'disks45/nocr/trec-robust-2004/fold{}'")
-    group.add_argument('--folds_json', type=str, help="Path to a custom JSON file defining the folds.")
+    group.add_argument('--folds-json', type=str, help="Path to a custom JSON file defining the folds.")
 
     # --- Optional arguments for custom folds ---
-    parser.add_argument('--dataset_name', type=str,
+    parser.add_argument('--dataset-name', type=str,
                         help="The base ir_datasets name for the custom collection (used with --folds_json).")
-    parser.add_argument('--num_folds', type=int, default=5, help="Number of folds (used with --dataset_pattern).")
+    parser.add_argument('--num-folds', type=int, default=5, help="Number of folds (used with --dataset_pattern).")
 
     args = parser.parse_args()
 
@@ -118,9 +118,9 @@ def main():
         create_cmd = [
             "python", "scripts/create_training_data.py",
             "--dataset", fold['train_dataset'],
-            "--output_dir", str(feature_dir),
-            "--index_path", args.index_path,
-            "--lucene_path", args.lucene_path,
+            "--output-dir", str(feature_dir),
+            "--index-path", args.index_path,
+            "--lucene-path", args.lucene_path,
         ]
         if 'train_qids_file' in fold:
             create_cmd.extend(["--query_ids_file", fold['train_qids_file']])
@@ -131,12 +131,12 @@ def main():
         feature_file = f"{feature_dir}/{fold['train_dataset'].replace('/', '_')}_features.json.gz"
         train_cmd = [
             "python", "scripts/train_weights.py",
-            "--feature_file", feature_file,
-            "--validation_dataset", fold['train_dataset'],
-            "--output_dir", str(model_dir),
+            "--feature-file", feature_file,
+            "--validation-dataset", fold['train_dataset'],
+            "--output-dir", str(model_dir),
         ]
         if 'train_qids_file' in fold:
-            train_cmd.extend(["--query_ids_file", fold['train_qids_file']])  # Note: train_weights needs this too
+            train_cmd.extend(["--query-ids-file", fold['train_qids_file']])  # Note: train_weights needs this too
         subprocess.run(train_cmd, check=True)
 
         # 3. Evaluate on the held-out test split
@@ -144,15 +144,15 @@ def main():
         weights_file = f"{model_dir}/learned_weights.json"
         eval_cmd = [
             "python", "scripts/evaluate_model.py",
-            "--weights_file", weights_file,
+            "--weights-file", weights_file,
             "--dataset", fold['test_dataset'],
-            "--output_dir", str(eval_dir),
-            "--index_path", args.index_path,
-            "--lucene_path", args.lucene_path,
-            "--save_runs",
+            "--output-dir", str(eval_dir),
+            "--index-path", args.index_path,
+            "--lucene-path", args.lucene_path,
+            "--save-runs",
         ]
         if 'test_qids_file' in fold:
-            eval_cmd.extend(["--query_ids_file", fold['test_qids_file']])  # Note: evaluate_model needs this
+            eval_cmd.extend(["--query-ids-file", fold['test_qids_file']])  # Note: evaluate_model needs this
         subprocess.run(eval_cmd, check=True)
 
         # Aggregate the run file from this fold

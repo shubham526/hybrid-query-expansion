@@ -138,29 +138,29 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     # --- Main Arguments ---
-    parser.add_argument('--weights_file', type=str, required=True, help='Path to the learned_weights.json file.')
+    parser.add_argument('--weights-file', type=str, required=True, help='Path to the learned_weights.json file.')
     parser.add_argument('--dataset', type=str, required=True, help='Name of the ir_datasets test set.')
-    parser.add_argument('--output_dir', type=str, required=True,
+    parser.add_argument('--output-dir', type=str, required=True,
                         help='Directory to save evaluation results and run files.')
 
     # --- Filtering and Model Arguments ---
-    parser.add_argument('--query_ids_file', type=str, default=None,
+    parser.add_argument('--query-ids-file', type=str, default=None,
                         help='Optional path to a file with query IDs to evaluate (for k-fold CV).')
-    parser.add_argument('--semantic_model', type=str, default='all-MiniLM-L6-v2',
+    parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
                         help='Sentence-transformer model for reranking.')
 
     # --- BM25 Arguments ---
-    parser.add_argument('--index_path', type=str, default=None, help='Path to the pre-built BM25 index.')
-    parser.add_argument('--lucene_path', type=str, default=None, help='Path to Lucene JAR files.')
+    parser.add_argument('--index-path', type=str, default=None, help='Path to the pre-built BM25 index.')
+    parser.add_argument('--lucene-path', type=str, default=None, help='Path to Lucene JAR files.')
 
     # --- Evaluation Options ---
-    parser.add_argument('--run_ablation', action='store_true',
+    parser.add_argument('--run-ablation', action='store_true',
                         help='If set, run a full ablation study with all baseline models.')
-    parser.add_argument('--save_runs', action='store_true',
+    parser.add_argument('--save-runs', action='store_true',
                         help='If set, save the TREC-formatted run file for each model.')
 
     # --- Logging ---
-    parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
     args = parser.parse_args()
 
