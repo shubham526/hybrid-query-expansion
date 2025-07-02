@@ -29,7 +29,7 @@ from tqdm import tqdm
 from src.core.rm_expansion import RMExpansion
 from src.core.semantic_similarity import SemanticSimilarity
 from src.models.expansion_models import create_baseline_comparison_models, ExpansionModel
-from src.models.multivector_reranking import MultiVectorReranker
+from src.models.memory_efficient_reranker import create_memory_efficient_reranker
 from src.evaluation.evaluator import TRECEvaluator
 from src.utils.file_utils import load_learned_weights, load_trec_run, save_json, save_trec_run, ensure_dir
 from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation, log_results
@@ -70,7 +70,7 @@ class ModelEvaluator:
     """Handles the end-to-end evaluation of expansion models."""
 
     def __init__(self,
-                 reranker: MultiVectorReranker,
+                 reranker,
                  rm_expansion: RMExpansion,
                  semantic_sim: SemanticSimilarity,
                  bm25_scorer: Optional[TokenBM25Scorer] = None,
@@ -123,7 +123,7 @@ class ModelEvaluator:
 
             candidate_results = [(doc_id, documents.get(doc_id, ""), score) for doc_id, score in first_stage_runs[qid]]
 
-            reranked_results = self.reranker.rerank(
+            reranked_results = self.reranker.rerank_streaming(
                 query=query_text,
                 expansion_terms=[(term, rm_terms_dict.get(term, 0.0)) for term in importance_weights.keys()],
                 importance_weights=importance_weights,
@@ -167,24 +167,27 @@ def main():
         logger.info(f"Loading learned weights from: {args.weights_file}")
         learned_weights = load_learned_weights(args.weights_file)
 
-        with TimedOperation(logger, "Initializing all components"):
-            reranker = MultiVectorReranker(model_name=args.semantic_model)
+        # STEP 1: Initialize basic components (no reranker yet)
+        with TimedOperation(logger, "Initializing core components"):
             rm_expansion = RMExpansion()
             semantic_sim = SemanticSimilarity(model_name=args.semantic_model)
             bm25_scorer = None
             if args.index_path:
-                if not BM25_AVAILABLE: raise ImportError("BM25 components requested but not available.")
-                if not args.lucene_path: raise ValueError("--lucene-path is required for BM25.")
+                if not BM25_AVAILABLE:
+                    raise ImportError("BM25 components requested but not available.")
+                if not args.lucene_path:
+                    raise ValueError("--lucene-path is required for BM25.")
                 initialize_lucene(args.lucene_path)
                 bm25_scorer = TokenBM25Scorer(args.index_path)
 
+        # STEP 2: Load dataset and build all_runs
         with TimedOperation(logger, f"Loading and filtering dataset: {args.dataset}"):
             dataset = ir_datasets.load(args.dataset)
             all_queries = {q.query_id: get_query_text(q) for q in dataset.queries_iter()}
             all_qrels = {qrel.query_id: {qrel.doc_id: qrel.relevance} for qrel in dataset.qrels_iter()}
             all_documents = {d.doc_id: (d.text if hasattr(d, 'text') else d.body) for d in dataset.docs_iter()}
 
-            # --- FIX: Implement the correct candidate set loading logic ---
+            # Load candidate set (this builds all_runs)
             all_runs = defaultdict(list)
             if dataset.has_scoreddocs():
                 logger.info("Found 'scoreddocs' in dataset. Using them as the candidate set.")
@@ -197,21 +200,39 @@ def main():
                 raise ValueError(
                     "A source for candidate documents is required for evaluation. Provide a run file via --run-file-path or use a dataset with scoreddocs.")
 
+            # Filter queries if needed
             qids_to_evaluate = set(all_queries.keys())
             if args.query_ids_file:
                 logger.info(f"Filtering evaluation to subset from: {args.query_ids_file}")
                 with open(args.query_ids_file, 'r') as f:
                     qids_to_evaluate = {line.strip() for line in f if line.strip()}
 
+            # Create evaluation data
             eval_data = {
                 'queries': {qid: text for qid, text in all_queries.items() if qid in qids_to_evaluate},
                 'qrels': {qid: qrels for qid, qrels in all_qrels.items() if qid in qids_to_evaluate},
                 'documents': all_documents,
                 'first_stage_runs': {qid: run for qid, run in all_runs.items() if qid in qids_to_evaluate}
             }
+
         logger.info(f"Loaded {len(eval_data['queries'])} queries for final evaluation.")
 
+        # STEP 3: NOW initialize memory-efficient reranker (after all_runs is defined)
+        with TimedOperation(logger, "Initializing memory-efficient reranker"):
+            # Calculate total candidates based on actual data
+            total_candidates = sum(len(candidates) for candidates in all_runs.values())
+            large_candidate_sets = total_candidates > 50000
+            logger.info(f"Total candidates across all queries: {total_candidates:,}")
+            logger.info(f"Using {'large' if large_candidate_sets else 'standard'} candidate set optimization")
+
+            reranker = create_memory_efficient_reranker(
+                model_name=args.semantic_model,
+                large_candidate_sets=large_candidate_sets
+            )
+
+        # STEP 4: Create evaluator and run evaluation
         evaluator = ModelEvaluator(reranker, rm_expansion, semantic_sim, bm25_scorer)
+
         models_to_run = {}
         if args.run_ablation:
             logger.info("Creating all baseline and ablation models for a full study.")
@@ -219,7 +240,8 @@ def main():
         else:
             logger.info("Evaluating only the final trained model ('our_method').")
             models_to_run['our_method'] = \
-            create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)['our_method']
+                create_baseline_comparison_models(rm_expansion, semantic_sim, bm25_scorer, learned_weights)[
+                    'our_method']
 
         all_runs_for_eval = {'FirstStage': eval_data['first_stage_runs']}
         for model_name, expansion_model in models_to_run.items():
@@ -228,6 +250,7 @@ def main():
                 run_results = evaluator.evaluate_model(expansion_model, eval_data)
                 all_runs_for_eval[model_name] = run_results
 
+        # STEP 5: Evaluate and save results
         trec_evaluator = TRECEvaluator()
         comparison_results = trec_evaluator.compare_runs(all_runs_for_eval, eval_data['qrels'],
                                                          baseline_run='FirstStage')
@@ -242,6 +265,14 @@ def main():
         print("\n" + "=" * 80 + f"\nFinal Results on {args.dataset}" + (
             " (filtered)" if args.query_ids_file else "") + "\n" + "=" * 80)
         print(trec_evaluator.create_results_table(comparison_results))
+
+        # Log final memory usage and cleanup
+        if hasattr(reranker, 'get_memory_stats'):
+            final_memory_stats = reranker.get_memory_stats()
+            logger.info(f"Final memory statistics: {final_memory_stats}")
+            # Clear caches before exit
+            reranker.clear_caches()
+
         print("=" * 80)
 
     except Exception as e:

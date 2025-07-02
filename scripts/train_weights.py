@@ -34,7 +34,6 @@ from tqdm import tqdm
 
 # Import your project's modules
 from src.models.weight_optimizer import create_optimizer
-from src.models.multivector_reranking import MultiVectorReranker
 from src.evaluation.evaluator import create_trec_dl_evaluator
 from src.utils.file_utils import load_json, load_trec_run, save_learned_weights, ensure_dir
 from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation, \
@@ -59,62 +58,48 @@ def get_query_text(query_obj: Any) -> str:
         return ""
 
 
-class WeightTrainer:
+class MemoryEfficientWeightTrainer:
     """
-    Trains importance weights for query expansion using pre-computed features.
+    Memory-efficient version of WeightTrainer that processes documents in batches.
     """
 
-    def __init__(self, reranker: MultiVectorReranker):
-        """Initializes the WeightTrainer."""
+    def __init__(self, reranker):
+        """Initialize with memory-efficient reranker."""
         self.reranker = reranker
-        logger.info("WeightTrainer initialized with a multi-vector reranker.")
+        logger.info("Memory-efficient WeightTrainer initialized")
 
     def create_evaluation_function(self,
                                    validation_data: Dict[str, Any],
                                    metric: str = "ndcg_cut_10") -> Callable[[Tuple[float, float, float]], float]:
-        """Creates a lightweight evaluation function for the optimizer."""
+        """Creates a memory-efficient evaluation function for the optimizer."""
         queries = validation_data['queries']
         qrels = validation_data['qrels']
         first_stage_runs = validation_data['first_stage_runs']
         features = validation_data['features']
         documents = validation_data['documents']
 
-        candidate_docs_text = {}
+        # Prepare candidate documents in memory-efficient format
+        candidate_docs_metadata = {}
         for qid, run in first_stage_runs.items():
-            if qid in queries:  # Ensure we only process relevant queries
-                candidate_docs_text[qid] = [(doc_id, documents.get(doc_id, ""), score) for doc_id, score in run]
+            if qid in queries:
+                candidate_docs_metadata[qid] = [
+                    (doc_id, score) for doc_id, score in run
+                ]
 
-        # PRE-ENCODE ALL DOCUMENTS FOR EFFICIENCY
-        logger.info("Pre-encoding documents for optimization...")
-        doc_encodings = {}
-        total_docs = sum(len(candidates) for candidates in candidate_docs_text.values())
-
-        with tqdm(total=total_docs, desc="Encoding documents") as pbar:
-            for qid, candidates in candidate_docs_text.items():
-                for doc_id, doc_text, _ in candidates:
-                    if doc_id not in doc_encodings:
-                        try:
-                            doc_encodings[doc_id] = self.reranker.encode_document(doc_text)
-                        except Exception as e:
-                            logger.warning(f"Failed to encode document {doc_id}: {e}")
-                            # Create dummy encoding as fallback
-                            doc_encodings[doc_id] = self.reranker.model.encode([""], convert_to_tensor=True)
-                    pbar.update(1)
-
-        logger.info(f"Successfully pre-encoded {len(doc_encodings)} unique documents")
+        logger.info("Memory-efficient evaluation function created (no pre-encoding)")
 
         def evaluate_weights(weights: Tuple[float, float, float]) -> float:
-            """The actual evaluation function passed to the optimizer."""
+            """Memory-efficient evaluation function."""
             alpha, beta, gamma = weights
             reranked_runs = {}
 
             for qid, query_text in queries.items():
-                if qid not in features or not candidate_docs_text.get(qid):
+                if qid not in features or qid not in candidate_docs_metadata:
                     continue
 
                 query_features = features[qid]
 
-                # Compute importance weights using learned combination
+                # Compute importance weights
                 importance_weights = {
                     term: (alpha * term_data['rm_weight'] +
                            beta * term_data['bm25_score'] +
@@ -122,38 +107,38 @@ class WeightTrainer:
                     for term, term_data in query_features['term_features'].items()
                 }
 
-                # FIXED: Pass actual RM weights instead of zeros
+                # Create expansion terms
                 expansion_terms = [(term, term_data['rm_weight'])
                                    for term, term_data in query_features['term_features'].items()]
 
-                # Create query vectors once
+                # Prepare candidate results for this query
+                candidate_results = []
+                for doc_id, first_stage_score in candidate_docs_metadata[qid]:
+                    doc_text = documents.get(doc_id, "")
+                    if doc_text:  # Only include documents we have text for
+                        candidate_results.append((doc_id, doc_text, first_stage_score))
+
+                if not candidate_results:
+                    # Fallback to first-stage ranking
+                    reranked_runs[qid] = [(doc_id, score) for doc_id, score in candidate_docs_metadata[qid]]
+                    continue
+
                 try:
-                    query_vectors = self.reranker.create_importance_weighted_query_vectors(
+                    # Use streaming reranking to avoid memory issues
+                    reranked_results = self.reranker.rerank_streaming(
                         query=query_text,
                         expansion_terms=expansion_terms,
-                        importance_weights=importance_weights
+                        importance_weights=importance_weights,
+                        candidate_results=candidate_results,
+                        top_k=1000  # Keep top 1000 for evaluation
                     )
 
-                    # Score against pre-encoded documents
-                    scored_docs = []
-                    for doc_id, doc_text, first_stage_score in candidate_docs_text[qid]:
-                        try:
-                            doc_vectors = doc_encodings[doc_id]  # Use cached encoding
-                            reranking_score = self.reranker.late_interaction_score(query_vectors, doc_vectors)
-                            scored_docs.append((doc_id, reranking_score))
-                        except Exception as e:
-                            logger.debug(f"Error scoring document {doc_id} for query {qid}: {e}")
-                            # Fallback to first-stage score
-                            scored_docs.append((doc_id, first_stage_score))
-
-                    # Sort by reranking score
-                    scored_docs.sort(key=lambda x: x[1], reverse=True)
-                    reranked_runs[qid] = scored_docs
+                    reranked_runs[qid] = reranked_results
 
                 except Exception as e:
                     logger.warning(f"Error reranking query {qid}: {e}")
-                    # Fallback: use first-stage ranking
-                    reranked_runs[qid] = [(doc_id, score) for doc_id, _, score in candidate_docs_text[qid]]
+                    # Fallback to first-stage ranking
+                    reranked_runs[qid] = [(doc_id, score) for doc_id, score in candidate_docs_metadata[qid]]
 
             if not reranked_runs:
                 logger.warning("No successful reranking results - returning 0.0")
@@ -163,8 +148,15 @@ class WeightTrainer:
                 evaluator = create_trec_dl_evaluator()
                 evaluation = evaluator.evaluate_run(reranked_runs, qrels)
                 score = evaluation.get(metric, 0.0)
-                logger.debug(f"Evaluated weights (α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}) -> {metric}: {score:.4f}")
+
+                # Log memory usage periodically
+                if hasattr(self.reranker, 'get_memory_stats'):
+                    memory_stats = self.reranker.get_memory_stats()
+                    logger.debug(f"Memory stats: {memory_stats}")
+
+                logger.debug(f"Weights (α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}) -> {metric}: {score:.4f}")
                 return score
+
             except Exception as e:
                 logger.warning(f"Error during evaluation: {e}")
                 return 0.0
@@ -175,17 +167,25 @@ class WeightTrainer:
               validation_data: Dict[str, Any],
               optimizer_type: str = "lbfgs",
               metric: str = "ndcg_cut_10") -> Tuple[float, float, float]:
-        """Executes the full weight training pipeline."""
-        logger.info(f"Starting weight training with optimizer '{optimizer_type}' to maximize '{metric}'")
+        """Train weights with memory-efficient evaluation."""
+        logger.info(f"Starting memory-efficient weight training with {optimizer_type}")
+
+        # Log initial memory stats
+        if hasattr(self.reranker, 'get_memory_stats'):
+            initial_stats = self.reranker.get_memory_stats()
+            logger.info(f"Initial memory stats: {initial_stats}")
 
         evaluation_function = self.create_evaluation_function(validation_data, metric)
 
-        with TimedOperation(logger, "Evaluating baseline performance (weights=1,1,1)"):
+        # Evaluate baseline
+        with TimedOperation(logger, "Evaluating baseline performance"):
             baseline_weights = (1.0, 1.0, 1.0)
             baseline_score = evaluation_function(baseline_weights)
-        logger.info(f"Baseline performance with equal weights ({metric}): {baseline_score:.4f}")
+        logger.info(f"Baseline performance: {baseline_score:.4f}")
 
+        # Optimize weights
         optimizer = create_optimizer(optimizer_type)
+
         with TimedOperation(logger, f"{optimizer_type.upper()} optimization"):
             optimal_weights = optimizer.optimize_weights(
                 training_data=None,
@@ -194,9 +194,11 @@ class WeightTrainer:
                 evaluation_function=evaluation_function
             )
 
-        with TimedOperation(logger, "Evaluating final learned weights"):
+        # Final evaluation
+        with TimedOperation(logger, "Evaluating final weights"):
             final_score = evaluation_function(optimal_weights)
 
+        # Log results and final memory stats
         log_weight_optimization(
             logger,
             initial_weights=baseline_weights,
@@ -205,6 +207,10 @@ class WeightTrainer:
             final_score=final_score,
             iterations=getattr(optimizer, 'iterations', 'N/A')
         )
+
+        if hasattr(self.reranker, 'get_memory_stats'):
+            final_stats = self.reranker.get_memory_stats()
+            logger.info(f"Final memory stats: {final_stats}")
 
         return optimal_weights
 
@@ -374,10 +380,26 @@ def main():
 
         logger.info(f"Successfully loaded and filtered data for {len(queries_to_use)} queries.")
 
-        # --- Initialize Components and Run Training ---
-        logger.info(f"Initializing reranker with model: {args.semantic_model}")
-        reranker = MultiVectorReranker(model_name=args.semantic_model)
-        trainer = WeightTrainer(reranker=reranker)
+        # --- Initialize Memory-Efficient Components ---
+        logger.info(f"Initializing memory-efficient reranker with model: {args.semantic_model}")
+
+        # Import the memory-efficient reranker
+        from src.models.memory_efficient_reranker import create_memory_efficient_reranker
+
+        # Determine if we expect large candidate sets
+        total_candidates = sum(len(run) for run in runs_to_use.values())
+        large_candidate_sets = total_candidates > 50000  # Threshold for "large"
+
+        logger.info(f"Total candidates across all queries: {total_candidates:,}")
+        logger.info(f"Using {'large' if large_candidate_sets else 'small'} candidate set optimization")
+
+        reranker = create_memory_efficient_reranker(
+            model_name=args.semantic_model,
+            large_candidate_sets=large_candidate_sets
+        )
+
+        # Use memory-efficient trainer
+        trainer = MemoryEfficientWeightTrainer(reranker=reranker)
 
         optimal_weights = trainer.train(
             validation_data=validation_data,
@@ -393,11 +415,15 @@ def main():
             experiment_info=vars(args)
         )
 
+        # Clear caches before exit
+        if hasattr(reranker, 'clear_caches'):
+            reranker.clear_caches()
+
     except Exception as e:
-        logger.critical(f"A critical error occurred during weight training: {e}", exc_info=True)
+        logger.critical(f"Critical error during weight training: {e}", exc_info=True)
         sys.exit(1)
 
-    logger.info("=" * 60 + "\nWEIGHT TRAINING SCRIPT COMPLETED SUCCESSFULLY\n" + "=" * 60)
+    logger.info("Weight training completed successfully!")
     logger.info(f"Optimal weights saved to: {weights_file_path}")
 
 
