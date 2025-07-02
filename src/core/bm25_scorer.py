@@ -3,7 +3,7 @@ import traceback
 import torch
 import logging
 import json
-from typing import Dict
+from typing import Dict, Iterator, Tuple, Optional
 from transformers import AutoTokenizer
 import numpy as np
 from tqdm import tqdm
@@ -77,35 +77,33 @@ class BERTTokenBM25Indexer:
             logger.error(f"Error initializing BERTTokenBM25Indexer: {e}")
             raise
 
-    def create_index(self, documents: Dict[str, str], index_path: str = None):
+    def create_index(self, documents_iterator: Iterator[Tuple[str, str]], num_docs: Optional[int] = None):
         """
-        Create a Lucene index with BERT token position mapping.
+        Create a Lucene index from an iterator of documents.
 
         Args:
-            documents: Dictionary of document_id -> document_text
-            index_path: Path to store the index. If None, uses the path from initialization
+            documents_iterator: An iterator that yields (doc_id, doc_text) tuples.
+            num_docs: The total number of documents, for the tqdm progress bar.
         """
-        if index_path is None:
-            index_path = self.index_path
-        if index_path is None:
-            raise ValueError("Index path must be provided either during initialization or when creating index")
+        # The index_path is now taken from the object's state
+        if self.index_path is None:
+            raise ValueError("Indexer must be initialized with an index_path.")
 
         writer = None
         try:
-            # Setup index writer
-            directory = self.FSDirectory.open(self.Path.get(index_path))
+            directory = self.FSDirectory.open(self.Path.get(self.index_path))
             analyzer = self.EnglishAnalyzer()
             config = self.IndexWriterConfig(analyzer)
             writer = self.IndexWriter(directory, config)
 
-            logger.info(f"Creating index at {index_path}")
+            logger.info(f"Creating index at {self.index_path}")
 
-            # Add counter for progress logging
-            for count, (doc_id, doc_text) in enumerate(tqdm(documents.items(), total=len(documents))):
+            # Use the iterator directly in tqdm. It no longer needs .items()
+            doc_stream = tqdm(documents_iterator, total=num_docs, desc="Indexing documents")
+
+            for doc_id, doc_text in doc_stream:
                 try:
-                    # BERT tokenization
                     tokens = self.tokenizer.tokenize(doc_text)
-
                     # Build full words and track positions
                     words = []
                     word_positions = []  # List of (word, start_pos, end_pos)

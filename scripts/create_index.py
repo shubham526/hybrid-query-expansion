@@ -72,34 +72,21 @@ class IndexCreator:
         logger.info(f"  BM25 parameters: k1={k1}, b={b}")
         logger.info(f"  Max length: {max_length}")
 
-    def load_document_collection(self, collection_name: str,
-                                 max_docs: Optional[int] = None) -> Iterator[Tuple[str, str]]:
+    def load_document_collection_generator(self, collection_name: str) -> Iterator[Tuple[str, str]]:
         """
-        Load document collection from ir_datasets.
-
-        Args:
-            collection_name: IR dataset collection name
-            max_docs: Maximum number of documents to load (for testing)
-
-        Yields:
-            (doc_id, doc_text) tuples
+        Creates a generator that yields documents one by one.
         """
-        logger.info(f"Loading document collection: {collection_name}")
-
+        logger.info(f"Setting up document generator for collection: {collection_name}")
         dataset = ir_datasets.load(collection_name)
 
-        doc_count = 0
         for doc in dataset.docs_iter():
-            if max_docs and doc_count >= max_docs:
-                break
-
-            yield (doc.doc_id, doc.text)
-            doc_count += 1
-
-            if doc_count % 100000 == 0:
-                logger.info(f"Loaded {doc_count:,} documents...")
-
-        logger.info(f"Finished loading {doc_count:,} documents")
+            if hasattr(doc, 'text'):
+                doc_content = doc.text
+            elif hasattr(doc, 'body'):
+                doc_content = doc.body
+            else:
+                continue
+            yield (doc.doc_id, doc_content)
 
     def create_index(self, collection_name: str, output_dir: str,
                      max_docs: Optional[int] = None) -> str:
@@ -127,66 +114,31 @@ class IndexCreator:
         logger.info("Initializing BERTTokenBM25Indexer...")
         indexer = BERTTokenBM25Indexer(
             index_path=str(index_path),
-            model_name=self.model_name,
-            k1=self.k1,
-            b=self.b,
-            max_length=self.max_length
+            model_name=self.model_name
         )
 
-        # Load document collection
         with TimedOperation(logger, "Document indexing"):
-            documents = self.load_document_collection(collection_name, max_docs)
+            # Get the total number of documents for the progress bar, if possible
+            try:
+                num_docs = ir_datasets.load(collection_name).docs_count()
+            except Exception:
+                num_docs = None  # Fallback if count is not available
 
-            # Index documents with progress tracking
-            doc_count = 0
-            batch_size = 1000
-            batch_docs = []
+            # Create the generator
+            doc_generator = self.load_document_collection_generator(collection_name)
 
-            for doc_id, doc_text in tqdm(documents, desc="Indexing documents"):
-                batch_docs.append((doc_id, doc_text))
-                doc_count += 1
+            # If max_docs is set, create a limited generator
+            if max_docs is not None:
+                from itertools import islice
+                doc_generator = islice(doc_generator, max_docs)
+                num_docs = max_docs
 
-                # Process in batches for better performance
-                if len(batch_docs) >= batch_size:
-                    self._index_batch(indexer, batch_docs)
-                    batch_docs = []
+            # Call the indexer's create_index method with the generator
+            indexer.create_index(doc_generator, num_docs=num_docs)
 
-                # Log progress
-                if doc_count % 100000 == 0:
-                    logger.info(f"Indexed {doc_count:,} documents")
-
-            # Process remaining documents
-            if batch_docs:
-                self._index_batch(indexer, batch_docs)
-
-            # Finalize index
-            logger.info("Finalizing index...")
-            indexer.close()
-
-        logger.info(f"Index creation completed: {index_path}")
-        logger.info(f"Total documents indexed: {doc_count:,}")
-
+        logger.info(f"Index creation completed.")
         return str(index_path)
 
-    def _index_batch(self, indexer: Any, batch_docs: List[Tuple[str, str]]) -> None:
-        """
-        Index a batch of documents.
-
-        Args:
-            indexer: BERTTokenBM25Indexer instance
-            batch_docs: List of (doc_id, doc_text) tuples
-        """
-        try:
-            for doc_id, doc_text in batch_docs:
-                indexer.add_document(doc_id, doc_text)
-        except Exception as e:
-            logger.warning(f"Failed to index batch: {e}")
-            # Try individual documents
-            for doc_id, doc_text in batch_docs:
-                try:
-                    indexer.add_document(doc_id, doc_text)
-                except Exception as doc_e:
-                    logger.warning(f"Failed to index document {doc_id}: {doc_e}")
 
     def validate_index(self, index_path: str, sample_queries: List[str] = None) -> bool:
         """
@@ -212,7 +164,7 @@ class IndexCreator:
 
         try:
             # Import scorer to test the index
-            from bert_bm25_scorer import TokenBM25Scorer
+            from src.core.bm25_scorer import TokenBM25Scorer
 
             # Initialize scorer with the new index
             scorer = TokenBM25Scorer(index_path)
@@ -254,7 +206,7 @@ class IndexCreator:
             Dictionary with index statistics
         """
         try:
-            from bert_bm25_scorer import TokenBM25Scorer
+            from src.core.bm25_scorer import  TokenBM25Scorer
 
             scorer = TokenBM25Scorer(index_path)
 
