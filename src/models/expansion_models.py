@@ -229,10 +229,8 @@ class ImportanceWeightedExpansionModel(ExpansionModel):
         )
 
         # Step 4: Compute BM25 scores if available
-        if self.bm25_scorer and reference_doc_id:
-            bm25_scores = self.bm25_scorer.compute_bm25_term_weight(
-                reference_doc_id, expansion_term_list
-            )
+        if self.bm25_scorer:
+            bm25_scores = self.bm25_scorer.compute_collection_level_bm25(expansion_term_list)
         else:
             bm25_scores = {term: 0.0 for term in expansion_term_list}
 

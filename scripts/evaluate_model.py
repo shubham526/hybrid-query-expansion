@@ -65,7 +65,6 @@ def get_query_text(query_obj: Any) -> str:
         return ""
 
 
-
 class ModelEvaluator:
     """Handles the end-to-end evaluation of expansion models."""
 
@@ -150,8 +149,8 @@ def main():
                         help='Optional path to a file with query IDs to evaluate.')
     parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
                         help='Sentence-transformer model for reranking.')
-    parser.add_argument('--index-path', type=str, default=None, help='Path to the pre-built BM25 index.')
-    parser.add_argument('--lucene-path', type=str, default=None, help='Path to Lucene JAR files.')
+    parser.add_argument('--index-path', type=str, required=True, help='Path to the pre-built BM25 index.')
+    parser.add_argument('--lucene-path', type=str, required=True, help='Path to Lucene JAR files.')
     parser.add_argument('--run-ablation', action='store_true', help='If set, run a full ablation study.')
     parser.add_argument('--save-runs', action='store_true',
                         help='If set, save the TREC-formatted run file for each model.')
@@ -167,16 +166,22 @@ def main():
         logger.info(f"Loading learned weights from: {args.weights_file}")
         learned_weights = load_learned_weights(args.weights_file)
 
-        # STEP 1: Initialize basic components (no reranker yet)
+        # STEP 1: Initialize core components
         with TimedOperation(logger, "Initializing core components"):
+            # Initialize Lucene first
+            if not args.index_path:
+                raise ValueError("--index-path is required for RM expansion")
+            if not args.lucene_path:
+                raise ValueError("--lucene-path is required for Lucene initialization")
+
+            initialize_lucene(args.lucene_path)
+
+            # Create RM expansion from index path
+            rm_expansion = RMExpansion(args.index_path)
             semantic_sim = SemanticSimilarity(model_name=args.semantic_model)
             bm25_scorer = None
-            if args.index_path:
-                if not BM25_AVAILABLE:
-                    raise ImportError("BM25 components requested but not available.")
-                if not args.lucene_path:
-                    raise ValueError("--lucene-path is required for BM25.")
-                initialize_lucene(args.lucene_path)
+
+            if BM25_AVAILABLE:
                 bm25_scorer = TokenBM25Scorer(args.index_path)
 
         # STEP 2: Load dataset and build all_runs
@@ -230,7 +235,7 @@ def main():
             )
 
         # STEP 4: Create evaluator and run evaluation
-        evaluator = ModelEvaluator(reranker, semantic_sim, bm25_scorer)
+        evaluator = ModelEvaluator(reranker, rm_expansion, semantic_sim, bm25_scorer)
 
         models_to_run = {}
         if args.run_ablation:

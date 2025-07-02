@@ -3,7 +3,7 @@ import traceback
 import torch
 import logging
 import json
-from typing import Dict, Iterator, Tuple, Optional
+from typing import Dict, Iterator, Tuple, Optional, List
 from transformers import AutoTokenizer
 import numpy as np
 from tqdm import tqdm
@@ -208,6 +208,41 @@ class TokenBM25Scorer:
         except Exception as e:
             logger.error(f"Error computing BM25 score: {e}")
             return {term: 0.0 for term in terms}
+
+    def compute_collection_level_bm25(self, terms: List[str], max_docs: int = 100) -> Dict[str, float]:
+        """
+        Score terms against entire collection instead of single document.
+
+        Args:
+            terms: Terms to score
+            max_docs: Maximum documents to consider per term
+
+        Returns:
+            Dict mapping terms to collection-level BM25 scores
+        """
+        term_scores = {}
+
+        for term in terms:
+            try:
+                # Create query for this term
+                term_query = self.TermQuery(self.Term("contents", term))
+
+                # Search across collection
+                hits = self.searcher.search(term_query, max_docs)
+
+                if hits.totalHits.value() > 0:
+                    # Use average of top document scores
+                    top_scores = [hit.score for hit in hits.scoreDocs[:min(10, len(hits.scoreDocs))]]
+                    avg_score = sum(top_scores) / len(top_scores) if top_scores else 0.0
+                    term_scores[term] = avg_score
+                else:
+                    term_scores[term] = 0.0
+
+            except Exception as e:
+                logger.debug(f"Error scoring term '{term}': {e}")
+                term_scores[term] = 0.0
+
+        return term_scores
 
     def get_token_scores(self, query: str, doc_id: str, max_length: int = 512) -> torch.Tensor:
         """
